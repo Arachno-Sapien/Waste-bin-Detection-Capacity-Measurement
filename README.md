@@ -9,6 +9,36 @@ Stack: Python 3.14, OpenCV, Ultralytics YOLO11 + YOLOE, Streamlit, NumPy.
 
 ---
 
+## 0. Setup (clone from GitHub)
+
+**Prerequisites:** Python 3.10+ (developed on 3.14), Git, and ~700MB free
+disk + internet access for the first run (model download, see below).
+
+```bash
+git clone https://github.com/Arachno-Sapien/Waste-bin-Detection-Capacity-Measurement.git
+cd Waste-bin-Detection-Capacity-Measurement/waste_vision_system
+
+python -m venv venv
+venv\Scripts\activate        # Windows
+# source venv/bin/activate   # macOS/Linux
+
+pip install -r requirements.txt
+
+python main.py                # Streamlit dashboard
+```
+
+Two model weight files are **not** in the repo (too large for GitHub —
+572MB/68MB) — `.gitignore`d and fetched by `ultralytics` automatically the
+first time `main.py` runs:
+
+- `yoloe-11l-seg.pt` (~70MB, bin detector)
+- `mobileclip_blt.ts` (~600MB, YOLOE's text encoder)
+
+The first run will pause while these download into `waste_vision_system/`
+(needs internet access); after that they're cached locally and every
+subsequent run is instant. `yolo11n-seg.pt` (waste detector, ~6MB) is small
+enough to ship in the repo, so no download is needed for that one.
+
 ## 1. What it does
 
 | Capability | Status |

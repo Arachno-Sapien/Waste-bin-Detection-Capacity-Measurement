@@ -1,0 +1,3 @@
+# large model weights - too big for GitHub, fetch/download separately
+waste_vision_system/mobileclip_blt.ts
+waste_vision_system/yoloe-11l-seg.pt
