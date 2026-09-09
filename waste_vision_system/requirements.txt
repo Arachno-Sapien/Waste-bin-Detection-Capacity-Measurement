@@ -1,0 +1,23 @@
+# Waste Vision System — Python Dependencies
+# ==========================================
+# Install:  pip install -r requirements.txt
+#
+# Open-vocab bin detection (YOLOE) also needs two model weight files that are
+# NOT pip packages — ultralytics downloads them on first run into the
+# waste_vision_system/ folder:
+#   yoloe-11l-seg.pt   (~70MB, bin detector)
+#   mobileclip_blt.ts  (~600MB, text encoder for the prompts)
+# First run will be slow while these download; after that they're cached.
+
+ultralytics>=8.1.0
+streamlit>=1.30.0
+streamlit-webrtc>=0.45.0
+opencv-python-headless>=4.8.0
+numpy>=1.24.0
+pandas>=2.0.0
+scipy>=1.11.0
+av>=10.0.0
+torch>=2.0.0
+ftfy>=6.0.0
+regex>=2023.0.0
+git+https://github.com/ultralytics/CLIP.git
