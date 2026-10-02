@@ -8,7 +8,6 @@ boundaries without touching any pipeline logic.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -154,24 +153,26 @@ class Settings:
     """Centralised runtime configuration — instantiate once, pass everywhere."""
 
     # ---- Model Paths ----
+    # Default weights are absolute so launching from another directory doesn't
+    # make Ultralytics re-download them into the current working directory.
     bin_model_path: str = ""  # Empty → use open-vocab / HSV strategies below
-    waste_model_path: str = "yolo11n-seg.pt"  # Segmentation model for waste
+    waste_model_path: str = str(_PROJECT_ROOT / "yolo11n-seg.pt")  # Segmentation model for waste
 
     # ---- Open-Vocabulary Bin Detection (YOLOE) ----
     # Localises bins from text prompts with no bin-specific training. Replaces
     # the HSV colour heuristic, which cannot separate a bin from a background
     # of the same colour (hedges, grass, walls) and fails outright at night.
     openvocab_enabled: bool = True
-    openvocab_model_path: str = "yoloe-11l-seg.pt"
+    openvocab_model_path: str = str(_PROJECT_ROOT / "yoloe-11l-seg.pt")
     openvocab_prompts: Tuple[str, ...] = (
         "trash can", "garbage bin", "waste bin", "rubbish bin",
         "recycling bin", "dumpster", "wheeled garbage bin",
     )
     openvocab_conf: float = 0.15
     openvocab_nms_iou: float = 0.5
-    # Two inference scales, one chosen per frame. Optimal scale depends on how
+    # Two inference scales, one chosen per scene. Optimal scale depends on how
     # much of the frame a bin fills: a close-up needs a small input, a row of
-    # distant bins needs a large one. See _pick_scale in bin_detector.py.
+    # distant bins needs a large one. See _detect_openvocab in bin_detector.py.
     openvocab_scales: Tuple[int, ...] = (640, 1280)
     openvocab_contain_frac: float = 0.85  # Overlap above which boxes are duplicates
 
@@ -195,7 +196,11 @@ class Settings:
     area_weight: float = 0.55       # Weight for aperture-focused area ratio
     height_weight: float = 0.25     # Weight for vertical fill height
     overflow_weight: float = 0.20   # Weight for overflow detection
-    smoothing_window: int = 5       # Frames for rolling average
+    # A row counts toward fill height once waste covers this fraction of the
+    # bin's width. 0.08 ≈ what the old "2% of frame width" rule worked out to
+    # on the fixtures, without depending on how wide the frame is.
+    height_row_min_frac: float = 0.08
+    smoothing_window: int = 5       # Frames for rolling median
     smoothing_enabled: bool = True  # False for single-image analysis (no temporal dimension)
 
     # ---- Bin Detection Heuristic ----
@@ -231,7 +236,10 @@ class Settings:
 
     def classify_fill(self, fill_pct: float) -> FillStatus:
         """Map a continuous fill percentage to a discrete status."""
-        pct = max(0.0, min(100.0, fill_pct))
+        # Round first: the tiers are whole-number ranges, so a raw 20.4 would
+        # fall in the 20–21 gap and hit the FULL fallback. round() also matches
+        # the "{:.0f}%" the UI shows next to the status.
+        pct = round(max(0.0, min(100.0, fill_pct)))
         for status, (lo, hi) in self.fill_thresholds.items():
             if lo <= pct <= hi:
                 return status

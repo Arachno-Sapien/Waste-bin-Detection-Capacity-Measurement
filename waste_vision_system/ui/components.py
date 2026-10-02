@@ -92,8 +92,8 @@ def render_action_buttons() -> Tuple[bool, bool]:
         (start_clicked, stop_clicked)
     """
     col1, col2 = st.sidebar.columns(2)
-    start = col1.button("Start", use_container_width=True, key="btn_start")
-    stop = col2.button("Stop", use_container_width=True, key="btn_stop")
+    start = col1.button("Start", width="stretch", key="btn_start")
+    stop = col2.button("Stop", width="stretch", key="btn_stop")
     return start, stop
 
 
@@ -109,8 +109,8 @@ def render_export_buttons() -> Tuple[bool, bool]:
     st.sidebar.markdown("---")
     st.sidebar.markdown("### Export")
     col1, col2 = st.sidebar.columns(2)
-    save = col1.button("Save Output", use_container_width=True, key="btn_save")
-    export = col2.button("Export CSV", use_container_width=True, key="btn_export")
+    save = col1.button("Save Output", width="stretch", key="btn_save")
+    export = col2.button("Export CSV", width="stretch", key="btn_export")
     return save, export
 
 

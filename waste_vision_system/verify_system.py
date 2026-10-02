@@ -280,15 +280,87 @@ def test_overflow_override():
 
     # Test 3: Moderate overflow (score=50) → fill >= 70%
     oe.reset(bin_id=97)
-    # Small waste strip above rim only
+    # Small patch just above rim_top=50: 50px of the 22x100 overflow band
+    # (0.45 x bin height 50) is ~2.3% — inside the 1–5% band that scores 50.
     small_waste = np.zeros((h, w), dtype=np.uint8)
-    small_waste[40:50, :] = 1  # Just above rim_top=50, 2% of total above area
+    small_waste[45:50, 0:10] = 1
     result3 = oe.estimate(bin_id=97, interior_mask=interior,
                           waste_masks=[small_waste], rim_top_y=50, rim_bottom_y=100)
     print(f"  Small overflow: fill={result3.fill_pct:.1f}%, overflow={result3.overflow_score:.0f}")
-    assert result3.fill_pct >= 70.0, f"Moderate overflow should force fill >= 70%, got {result3.fill_pct}"
+    assert result3.overflow_score == 50.0, f"Expected the moderate tier (50), got {result3.overflow_score}"
+    assert 70.0 <= result3.fill_pct < 85.0, f"Moderate overflow should force fill into NEARLY FULL, got {result3.fill_pct}"
 
     print("Test 5 PASSED")
+    return True
+
+
+def test_occupancy_invariants():
+    """
+    Test 7: Occupancy Invariants (no model needed)
+    - Every fill value maps to the tier its rounded value names. Raw values
+      between the whole-number tiers (e.g. 20.4) used to fall through to FULL.
+    - The overflow score depends on the bin, not on how wide the frame is or
+      where the bin sits vertically. It used to scale with both.
+    """
+    print("\n--- Running Test 7: Occupancy Invariants ---")
+    settings = Settings()
+    settings.smoothing_enabled = False
+
+    for pct, want in [(20.4, FillStatus.EMPTY), (20.6, FillStatus.LOW),
+                      (60.3, FillStatus.MEDIUM), (80.4, FillStatus.NEARLY_FULL),
+                      (80.6, FillStatus.FULL), (-5, FillStatus.EMPTY), (130, FillStatus.FULL)]:
+        got = settings.classify_fill(pct)
+        assert got == want, f"classify_fill({pct}) = {got.value}, expected {want.value}"
+
+    oe = OccupancyEstimator(settings)
+    scores = []
+    for frame_w, top in [(640, 400), (1920, 400), (640, 100)]:
+        # Same 200x400 bin with the same 120x60 heap on its rim each time.
+        interior = np.zeros((1080, frame_w), np.uint8)
+        interior[top:top + 400, 100:300] = 1
+        waste = np.zeros_like(interior)
+        waste[top - 60:top, 140:260] = 1
+        scores.append(oe.estimate(1, interior, [waste], top, top + 400).overflow_score)
+    print(f"  Overflow score for the same bin across frame sizes/positions: {scores}")
+    assert len(set(scores)) == 1, f"Overflow score depends on framing: {scores}"
+
+    print("Test 7 PASSED")
+    return True
+
+
+def test_scale_caching():
+    """
+    Test 8: Open-Vocab Scale Caching (001.jpg)
+    The first frame of a scene compares every YOLOE scale; later frames must
+    run only the winning scale and give the same boxes, and reset_tracking()
+    (new upload / stream) must bring back the full comparison.
+    """
+    print("\n--- Running Test 8: Open-Vocab Scale Caching ---")
+    img_path = test_image_path()
+    if not img_path.exists():
+        print(f"Skipping Test 8: Image not found at {img_path}")
+        return SKIPPED
+
+    settings = Settings()
+    bd = BinDetector(settings)
+    img = cv2.imread(str(img_path))
+
+    first = [b.bbox for b in bd.detect(img)]
+    scale = bd._ov_scale
+    assert scale in settings.openvocab_scales, f"No scale cached after frame 1: {scale}"
+
+    model = bd._load_openvocab()
+    calls, predict = [], model.predict
+    model.predict = lambda *a, **k: (calls.append(k["imgsz"]), predict(*a, **k))[1]
+    second = [b.bbox for b in bd.detect(img)]
+    print(f"  Cached scale {scale}; frame 2 ran scales {calls}")
+    assert calls == [scale], f"Frame 2 should run only scale {scale}, ran {calls}"
+    assert second == first, f"Cached scale changed the boxes: {first} -> {second}"
+
+    bd.reset_tracking()
+    assert bd._ov_scale is None, "reset_tracking() must clear the cached scale"
+
+    print("Test 8 PASSED")
     return True
 
 
@@ -356,6 +428,8 @@ TESTS = [
     ("Manual ROI Path", test_manual_rois),
     ("Overflow Override", test_overflow_override),
     ("Additional Fixture Images", test_additional_fixtures),
+    ("Occupancy Invariants", test_occupancy_invariants),
+    ("Open-Vocab Scale Caching", test_scale_caching),
 ]
 
 

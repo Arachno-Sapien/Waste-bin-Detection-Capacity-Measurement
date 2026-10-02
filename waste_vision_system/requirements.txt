@@ -1,22 +1,30 @@
 # Waste Vision System — Python Dependencies
 # ==========================================
 # Install:  pip install -r requirements.txt
+# Requires Python 3.11+ (the code uses contextlib.chdir).
 #
 # Open-vocab bin detection (YOLOE) also needs two model weight files that are
-# NOT pip packages — ultralytics downloads them on first run into the
+# NOT pip packages — ultralytics downloads them on first use into the
 # waste_vision_system/ folder:
-#   yoloe-11l-seg.pt   (~70MB, bin detector)
-#   mobileclip_blt.ts  (~600MB, text encoder for the prompts)
-# First run will be slow while these download; after that they're cached.
+#   yoloe-11l-seg.pt   (~68MB, bin detector)
+#   mobileclip_blt.ts  (~572MB, text encoder for the prompts)
+# The first run then bakes the prompts into yoloe-11l-seg-bins.pt (~68MB,
+# generated locally, not downloaded). Later runs load that file directly and
+# need no text encoder, so mobileclip_blt.ts can be deleted afterwards. It (and
+# the CLIP/ftfy/regex packages below) is only needed again on a fresh clone's
+# first run, or if Settings.openvocab_prompts changes — that triggers an
+# automatic re-bake (re-downloading the encoder, ~572MB, if it was deleted).
+# First run will be slow while these download and the prompts are encoded.
 
-ultralytics>=8.1.0
-streamlit>=1.30.0
-streamlit-webrtc>=0.45.0
-opencv-python-headless>=4.8.0
+#
+# OpenCV: ultralytics installs opencv-python (GUI build; cv2.imshow in
+# `main.py --headless` needs it). Do NOT also install opencv-python-headless —
+# both provide `cv2`, and if the headless one wins cv2.imshow() raises.
+
+ultralytics>=8.4.0
+streamlit>=1.50.0
 numpy>=1.24.0
 pandas>=2.0.0
-scipy>=1.11.0
-av>=10.0.0
 torch>=2.0.0
 ftfy>=6.0.0
 regex>=2023.0.0

@@ -28,11 +28,31 @@ T-12/T-13/T-14/T-15 (need T-01's labelled set or training time), T-17
 (architecture decision for later), and the HSV-cluster half of §4 (gated on
 T-13 validating).
 
-**Found but not fixed** (out of this pass's scope, flagging for whoever
-picks up T-08/video work): `main.py --headless` with the default
-`frame_skip=3` silently processes **zero** frames on a single-image source —
-`frame_count` starts at 1, `1 % 3 != 0`, so the one frame is skipped and the
-CSV export comes back empty. Unrelated to T-02/T-03/T-04.
+**✅ FIXED (2026-10-02 review pass):** `main.py --headless` used to process
+**zero** frames on a single-image source (`1 % 3 != 0` skipped frame 1); the
+skip test is now `(frame_count - 1) % frame_skip`, in `ui/app.py` too. The
+same pass also fixed: `classify_fill` returning FULL for values between the
+whole-number tiers (e.g. 20.4%); the overflow score scaling with frame width
+and the bin's y-position (Test 7 guards both); the vertical-fill row
+threshold being 2% of the *frame* width (now `Settings.height_row_min_frac`
+of the bin's width); letterboxed masks being resized without un-padding
+(`retina_masks=True`); an empty YOLOE scale beating one that found bins; the
+image-mode ROI editor resetting on every rerun (`id(source)` → `file_id`);
+CSV auto-flush rewriting the whole file every 100 rows (it now appends, and
+memory keeps only the last 200 rows); captures/temp files leaking when a
+Streamlit rerun interrupted a stream; weights re-downloading when launched
+from another CWD (default model paths are now absolute); the headless output
+video mixing annotated and un-annotated frames (it now holds only processed
+frames, at source fps ÷ `frame_skip`); `CAP_DSHOW` being forced on
+non-Windows; `requirements.txt` carrying `opencv-python-headless` (which can
+shadow the GUI build and break `cv2.imshow`) plus unused packages. Python
+3.11+ is required (`contextlib.chdir`).
+
+Two optimizations landed with it: **prompt baking** (§2.3) removes the
+~572MB text encoder from every run after the first, and **scale caching**
+(T-08) compares both YOLOE scales once per scene instead of every frame.
+`verify_system.py` is now 8 tests (7 = occupancy invariants, 8 = scale
+caching), all passing; the "6/6" above is the 2026-09-09 state.
 
 ---
 
@@ -48,8 +68,13 @@ python main.py --headless --source path/img.jpg # CLI, no UI
 python verify_system.py                         # test suite
 ```
 
-First run downloads `yoloe-11l-seg.pt` (~70MB) and `mobileclip_blt.ts`
-(~600MB) into this folder. Slow once, cached after.
+The first time a bin is detected (not at launch — models load lazily),
+Ultralytics downloads `yoloe-11l-seg.pt` (~68MB) and `mobileclip_blt.ts`
+(~572MB) into this folder, and the app bakes the bin prompts into
+`yoloe-11l-seg-bins.pt` (see §2.3). Slow once; every later run loads the baked
+file and never touches the text encoder, so `mobileclip_blt.ts` can be
+deleted. It comes back (re-downloaded) only on a fresh clone's first run or
+after `Settings.openvocab_prompts` changes. Requires Python 3.11+.
 
 ### 0.2 The single most important dev gotcha
 
@@ -70,23 +95,38 @@ python main.py
 
 ### 0.3 Environment facts
 
-- Python 3.14, global install at `C:\Python314\python.exe`. There is **no
+- Python 3.14 (the code needs 3.11+, for `contextlib.chdir`), global install
+  at `C:\Python314\python.exe`. There is **no
   virtualenv** — one existed and was deleted as stale. If you create one,
   update `run_app.bat` and `check_requirements.bat`, which currently assume a
   bare global `python`.
 - **CPU only.** `torch 2.13.0+cpu`, no CUDA. `Settings.resolve_device()`
   auto-detects and will use CUDA/MPS if you move to a machine that has it.
-- Inference is slow: the bin detector runs **two forward passes per frame**
-  (two scales, see §2.3). Fine for stills, a problem for video (see T-08).
+- Inference is slow: the bin detector runs **two forward passes on a scene's
+  first frame** (both scales) and one per frame after that (the winning scale
+  is cached until `reset_tracking()`; see §2.3). Fine for stills; video is
+  faster since T-08's partial fix (~0.56s per frame where 640 wins, measured
+  on CPU) but still not real-time.
+- OpenCV: `ultralytics` installs `opencv-python` (the GUI build). Do **not**
+  also install `opencv-python-headless` — both provide `cv2`, the headless one
+  can win, and `cv2.imshow` (headless mode without `--no-display`) then
+  raises. `requirements.txt` deliberately doesn't list it.
+- As of 2026-10-02 `mobileclip_blt.ts` is not in the project folder (deleted
+  after baking). The app runs without it; it is re-downloaded (~572MB) only if
+  the prompts change. `models/yolov8n-seg.pt` exists but nothing references
+  it (`MODELS_DIR` is created in `settings.py` and never read).
 
 ### 0.4 Invariants — do not break these
 
 1. `Settings` (`config/settings.py`) is the **only** place tunables live.
    Do not hardcode a threshold in a detector. If you add one, add it there.
+   (Known exceptions — the occupancy model's 2.5× fallback, 5% opening check
+   and overflow cutoffs, plus the tracker's IoU 0.3 and the Canny thresholds —
+   are listed in T-15 and §2.2.)
 2. `BinDetection.interior_mask` and all waste masks are **full-frame** binary
    masks (`uint8`, 0/1), not crops. Several places assume this.
 3. Manual ROIs always win over every automatic strategy
-   (`bin_detector.py:183` `detect()`). This is the operator's override; never
+   (`bin_detector.py:186` `detect()`). This is the operator's override; never
    reorder it below an automatic path.
 4. `verify_system.py` must stay runnable with **no arguments** and must exit
    non-zero on failure (1 = failure, 2 = incomplete/skipped, 0 = all passed).
@@ -113,16 +153,19 @@ frame-spanning garbage boxes on the other four.
 
 ### 1.2 Fill estimation: partially working
 
-Measured via the **app's** occupancy path (using `surface_mask`, see §1.3):
+Measured via the **app's** occupancy path (using `surface_mask`, see §1.3);
+re-measured 2026-10-02 after the review pass changed the overflow band and
+fill-height scan to use the bin's own columns (§2.4), which moved some bins
+(`timg (2).jpg` bins 2,3 were 70% / 85%; `timg (3).png` was 74%):
 
 | Fixture | Reported | Reality | Verdict |
 |---|---|---|---|
 | `001.jpg` | 85% FULL ×4 | overflowing | ✓ correct |
-| `timg (2).png` | 82% / 100% FULL | both full | ✓ correct |
+| `timg (2).png` | 81% / 100% FULL | both full | ✓ correct |
 | `timg (2).jpg` bin 1 | 12% EMPTY | empty | ✓ correct |
 | `timg (1).png` | 74% / 85% | ~40–50% | ✗ over-reads |
-| `timg (3).png` | 74% NEARLY FULL | ~95%+ | ✗ under-reads |
-| `timg (2).jpg` bins 2,3 | 70% / 85% | ~30–40% | ✗ over-reads |
+| `timg (3).png` | 72% NEARLY FULL | ~95%+ | ✗ under-reads |
+| `timg (2).jpg` bins 2,3 | 27% LOW / 70% NEARLY FULL | ~30–40% | bin 3 ✗ over-reads; bin 2 slightly low |
 
 **Cause of the over-reads:** dense foliage directly above a bin is highly
 textured, so it passes the overflow band's texture gate
@@ -168,18 +211,18 @@ path. Fixed by **T-04** below; do that before any fill tuning work.
 
 | File | Lines | Role |
 |---|---|---|
-| `main.py` | 219 | Entry point. No args → launches Streamlit. `--headless --source X` → CLI pipeline. |
-| `config/settings.py` | 271 | `Settings` dataclass + colour palettes + `WASTE_COCO_MAPPING` + `BIN_HSV_RANGES`. |
-| `detectors/bin_detector.py` | 1038 | `BinDetection`, `_SimpleTracker`, `BinDetector` (4 strategies). |
-| `detectors/waste_detector.py` | 406 | `WasteDetection`, `WasteDetector` (YOLO + colour inversion + overflow band). |
-| `services/occupancy.py` | 299 | `OccupancyResult`, `OccupancyEstimator` (3-factor fill). |
-| `services/stream_handler.py` | 229 | Webcam/RTSP lifecycle, reconnect backoff. |
-| `services/logger.py` | 155 | CSV logging, buffered flush. |
-| `ui/app.py` | 704 | Streamlit dashboard + `process_frame()` orchestration. |
+| `main.py` | 203 | Entry point. No args → launches Streamlit. `--headless --source X` → CLI pipeline. |
+| `config/settings.py` | 260 | `Settings` dataclass + colour palettes + `WASTE_COCO_MAPPING` + `BIN_HSV_RANGES`. |
+| `detectors/bin_detector.py` | 987 | `BinDetection`, `_SimpleTracker`, `BinDetector` (4 strategies). |
+| `detectors/waste_detector.py` | 402 | `WasteDetection`, `WasteDetector` (YOLO + colour inversion + overflow band). |
+| `services/occupancy.py` | 338 | `OccupancyResult`, `OccupancyEstimator` (3-factor fill), `wall_mask_for()`. |
+| `services/stream_handler.py` | 232 | Webcam/RTSP lifecycle, reconnect backoff (DirectShow only on Windows). |
+| `services/logger.py` | 154 | CSV logging; appends to the session CSV on flush, keeps the last 200 rows in memory. |
+| `ui/app.py` | 725 | Streamlit dashboard + `process_frame()` orchestration. |
 | `ui/components.py` | 246 | Sidebar widgets, status cards. |
 | `utils/drawing.py` | 212 | HUD overlays, bounding boxes, fill bars. |
 | `utils/fps_counter.py` | 56 | Rolling FPS/latency. |
-| `verify_system.py` | 419 | 6-test suite. |
+| `verify_system.py` | 478 | 8-test suite. |
 
 ~~`demo_test.py`~~ — deleted (T-07, done).
 
@@ -187,61 +230,93 @@ path. Fixed by **T-04** below; do that before any fill tuning work.
 
 | Line | Symbol | Status |
 |---|---|---|
-| 45 | `BinDetection` dataclass | active — note `surface_mask` field |
-| 65–120 | `_SimpleTracker` | active. IoU threshold hardcoded `0.3` at line 68, **not** wired to `Settings.iou_threshold` (which is YOLO NMS IoU — a different thing; do not "fix" by merging them) |
-| 183 | `detect()` — strategy dispatch | active, the entry point |
-| 204–241 | `_frac_inside`, `_overlap`, `_dedupe_boxes`, `_messiness` | active — open-vocab helpers |
-| 242 | `_detect_openvocab()` | active — **default strategy** |
-| 339 | `_load_openvocab()` | active — lazy model load |
-| 360 | `_detect_yolo()` | active but unused (no fine-tuned model exists yet) |
-| 432 | `_detect_manual_rois()` | active |
-| 479 | `_detect_hsv_color()` | **legacy fallback** |
-| 668 | `_conservative_split()` | legacy, HSV-only |
-| 773 | `_trim_open_lid()` | legacy, HSV-only |
-| 848 | `_merge_adjacent_bin_segments()` | legacy, HSV-only |
+| 47 | `BinDetection` dataclass | active — note `surface_mask` field |
+| 67–118 | `_SimpleTracker` | active. IoU threshold hardcoded `0.3` at line 70, **not** wired to `Settings.iou_threshold` (which is YOLO NMS IoU — a different thing; do not "fix" by merging them) |
+| 186 | `detect()` — strategy dispatch | active, the entry point |
+| 207–243 | `_frac_inside`, `_overlap`, `_dedupe_boxes`, `_messiness` | active — open-vocab helpers |
+| 245 | `_detect_openvocab()` | active — **default strategy**; compares scales on a scene's first frame, then reuses the winner (`_ov_scale`) |
+| 354 | `_load_openvocab()` | active — lazy model load; loads or creates the baked-prompt weights (§2.3) |
+| 388 | `_detect_yolo()` | active but unused (no fine-tuned model exists yet) |
+| 459 | `_detect_manual_rois()` | active |
+| 506 | `_detect_hsv_color()` | **legacy fallback** |
+| 695 | `_conservative_split()` | legacy, HSV-only |
+| 800 | `_trim_open_lid()` | legacy, HSV-only |
+| 875 | `_merge_adjacent_bin_segments()` | legacy, HSV-only |
 | ~~922~~ | `_split_by_vertical_profile()` | **REMOVED (§4, done)** — was dead, never called |
-| 1001 | `_dominant_bin_color()` | active — used by all strategies for `bin_hsv_range` |
-| 1025 | `_make_rect_mask()` | active — used by `_detect_yolo` |
-| 1036 | `reset_tracking()` | **wired in (T-02, done)** — called from `ui/app.py` on every new upload / stream start |
+| 949 | `_dominant_bin_color()` | active — used by all strategies for `bin_hsv_range` |
+| 973 | `_make_rect_mask()` | active — used by `_detect_yolo` |
+| 984 | `reset_tracking()` | **wired in (T-02, done)** — called from `ui/app.py` on every new upload / stream start; also clears the cached YOLOE scale |
 
 ### 2.3 Detection strategy order
 
-`detect()` at `bin_detector.py:183` tries in this order:
+`detect()` at `bin_detector.py:186` tries in this order:
 
 1. **Manual ROIs** — if `set_manual_rois()` was called. Operator override.
 2. **Custom YOLO** — if `Settings.bin_model_path` is non-empty. *No model
    exists yet; this is the hook for T-13.*
 3. **Open-vocabulary YOLOE** — if `Settings.openvocab_enabled` (default `True`).
-   Falls through to HSV **only if it returns zero detections**.
+   Falls through to HSV **only if it returns zero detections** (which includes
+   the model failing to load).
 4. **HSV colour** — legacy fallback.
 
-**How the open-vocab pass works** (`_detect_openvocab`, line 242) — this is
+**How the open-vocab pass works** (`_detect_openvocab`, line 245) — this is
 non-obvious, read before modifying:
 
-- Runs inference at **each scale in `Settings.openvocab_scales`** (default
-  `(640, 1280)`), not once.
+- On a scene's **first frame** it runs inference at **each scale in
+  `Settings.openvocab_scales`** (default `(640, 1280)`), not once. The winner
+  is cached in `_ov_scale`; later frames run only that scale until
+  `reset_tracking()` (every new image upload / video / webcam / RTSP start).
+  If the cached scale finds no bins, the next frame re-compares both. The
+  catch: a single stream that pans/zooms or cuts between cameras keeps its
+  first scene's scale (re-pick every N frames if that matters).
 - **Why two scales:** optimal `imgsz` depends on how much of the frame the bin
   fills. A close-up (`timg (3).png`) needs ≤640 and returns garbage at 1280; a
   row of four distant bins (`001.jpg`) needs 1280 and returns *nothing* at 640.
 - **Scale selection**, not merging: each scale's boxes are deduped, then scored
-  by `_messiness()` (max mutual overlap among surviving boxes). The **cleanest**
-  scale wins; near-ties break toward more detections. Rationale: a scale that
-  can't resolve the scene emits several partly-overlapping boxes for one object.
+  by `_messiness()` (max mutual overlap among surviving boxes). A scale that
+  found bins always beats one that found none (an empty set is trivially
+  "clean"); otherwise the **cleanest** scale wins, and near-ties break toward
+  more detections. Rationale: a scale that can't resolve the scene emits
+  several partly-overlapping boxes for one object.
 - **Do not "improve" this by pooling both scales' detections.** That was tried
   and scored *worse* (3/5 vs 5/5) — the same bin found at two scales yields
   offset boxes that don't dedupe.
+- Inference uses `retina_masks=True`, so instance masks come back at the
+  original frame resolution. Without it the letterboxed masks have to be
+  resized, which put the rim ~15px off at 1080p.
 - `_dedupe_boxes()` uses **containment overlap**, not IoU, because the two
   duplicate patterns YOLOE produces (same bin matched by several prompt terms;
   same bin with and without its open lid) are nested or offset, and standard
   NMS misses both.
 
+**Prompt baking** (`_load_openvocab`, line 354). YOLOE needs the text prompts
+encoded by a text encoder (`mobileclip_blt.ts`, ~572MB, plus CLIP). That is
+done once and saved: the weights with the 7 `openvocab_prompts` embeddings
+baked in are written to `yoloe-11l-seg-bins.pt` (~68MB, next to the base
+weights; gitignored).
+
+- If that file exists **and its class names equal `Settings.openvocab_prompts`**,
+  it is loaded directly — no text encoder, no CLIP.
+- Otherwise (fresh clone, or the prompts changed) it loads `yoloe-11l-seg.pt`,
+  encodes the prompts (Ultralytics downloads `mobileclip_blt.ts` into the
+  weights folder if missing — the encoding runs inside
+  `contextlib.chdir(<weights folder>)`, since Ultralytics looks for the
+  encoder in the CWD; that is why Python 3.11+ is required), and saves the
+  baked file via a temp file + atomic replace so a crash can't leave a
+  half-written `.pt`. Delete the baked file to force a re-bake.
+- Measured: baked load 0.6s vs ~2–7s for prompt encoding; identical detections
+  and an identical test-suite output.
+
 ### 2.4 Per-frame pipeline
 
-`process_frame()` at `ui/app.py:134` (mirrored in `main.py:_run_headless`):
+`process_frame()` at `ui/app.py:134` (mirrored in `main.py:_run_headless`).
+Video and headless runs only send every `frame_skip`-th frame through it —
+`(frame_count - 1) % frame_skip`, so frame 1 is always processed:
 
 ```
 frame
   └─> BinDetector.detect()                    -> List[BinDetection]
+        │   (YOLOE: both scales on a scene's first frame, cached scale after)
         for each bin:
         ├─> WasteDetector.detect()            -> List[WasteDetection]
         │     - YOLO seg on bin crop
@@ -251,10 +326,16 @@ frame
         │     surface_mask if present, else HSV colour-range match
         ├─> OccupancyEstimator.estimate()     -> OccupancyResult
         │     - area ratio (0.55) + height (0.25) + overflow (0.20)
+        │     - height + overflow look only at the bin's own columns; the
+        │       overflow band is bin height × waste_overflow_band_ratio
+        │       above the rim; a height row needs height_row_min_frac of
+        │       the bin's width
         │     - overflow override: >=80 forces >=85%; >=50 forces >=70%
         │     - temporal smoothing over `smoothing_window` frames
+        │     - classify_fill() rounds to a whole % before matching tiers
         ├─> draw_bin_overlay()
-        └─> DataLogger.log_entry()
+        └─> DataLogger.log_entry()   (buffered; appended to the session CSV
+                                      every csv_flush_interval rows / export)
   └─> draw_hud_header()
 ```
 
@@ -492,7 +573,7 @@ match those from `python main.py --headless --source tests/fixtures/001.jpg`
 
 ### T-05 · Tighten Test 1's assertion `[LOW · ~5 min]`
 
-`verify_system.py:136` asserts `len(bin_dets) >= 2` on an image whose ground
+`verify_system.py:123` asserts `len(bin_dets) >= 2` on an image whose ground
 truth is 4, then merely *prints* a note if the count isn't 4. Detection is now
 reliably 4. Make it assert the truth:
 
@@ -543,17 +624,28 @@ Do not leave it as-is; it's a trap for the next person.
 
 ### T-08 · Two forward passes per frame is too slow for video `[MEDIUM · deferred]`
 
-`_detect_openvocab` runs inference once per entry in `openvocab_scales`
-(default 2). On CPU this roughly doubles per-frame cost — measured latency in
-the UI was ~11s for a single image.
+`_detect_openvocab` originally ran inference once per entry in
+`openvocab_scales` (default 2) on *every* frame. On CPU this roughly doubled
+per-frame cost — measured latency in the UI was ~11s for a single image.
 
 **Do not fix by dropping a scale** — §2.3 explains why both are needed
 zero-shot. The real fix is T-13: a fine-tuned model won't need multi-scale, so
 `openvocab_scales` collapses to one entry (or the strategy is retired
 entirely). Until then, for video, `Settings.frame_skip` (default 3) already
-limits full-pipeline runs — see `ui/app.py:445` and `main.py:86`.
+limits full-pipeline runs — see `ui/app.py:447` and `main.py:89`.
 
 Revisit after T-13. Track the cost; don't optimize it yet.
+
+**✅ Partially addressed (2026-10-02):** both scales are still compared, but
+once per *scene* (first frame after `reset_tracking()`), not per frame;
+later frames reuse the winner (if it finds no bins, the next frame
+re-compares both). Measured on the fixtures as a 4-frame stream, CPU only:
+same boxes on every frame, 5.1–5.3× faster per frame where 640 wins
+(`timg (1).png`, `timg (2).png`, `timg (3).png`: ~3.0s → ~0.56s), 1.3× where
+1280 wins (`001.jpg` at 1080p, `timg (2).jpg`). Ceiling: one stream that
+pans/zooms or cuts between cameras keeps its first scene's scale — re-pick
+every N frames if that matters. Guarded by `verify_system.py` Test 8. T-13
+remains the real fix.
 
 ---
 
@@ -686,6 +778,12 @@ Ordered by cost. Stop when it's good enough — don't do all four reflexively.
 `openvocab_scales` were chosen by hand against 5 images. Sweep them against
 T-01's labelled set, take what maximises mAP50.
 
+Gotcha: every change to `openvocab_prompts` invalidates the baked weights
+(§2.3), so the next run re-encodes the prompts and overwrites
+`yoloe-11l-seg-bins.pt` — which needs `mobileclip_blt.ts` (~572MB; it
+re-downloads if you've deleted it) and costs ~2–7s per prompt set. Fine for a
+sweep; just don't be surprised by it.
+
 Also try **YOLOE visual prompts** — it accepts *image* exemplars alongside
 text. Feed 3–5 crops of the actual bin models in the deployment. Catches
 styles the text embedding misses. Still no training required.
@@ -710,11 +808,11 @@ Also add grayscale augmentation (simulates IR night mode) and JPEG artifacts
 
 **Wiring is already done.** Set `Settings.bin_model_path` to the resulting
 weights and `detect()`'s strategy order (§2.3) picks it up — `_detect_yolo()`
-at `bin_detector.py:360` already populates `bin_color_name`/`bin_hsv_range` and
+at `bin_detector.py:388` already populates `bin_color_name`/`bin_hsv_range` and
 handles masks. **No other code changes needed.**
 
 > Note: `_detect_yolo()` does **not** currently set `surface_mask`. Add that —
-> it produces `seg_mask` at line ~396 already, so pass it through to the
+> it produces `seg_mask` at line ~419 already, so pass it through to the
 > `BinDetection(...)` constructor. Without it, fine-tuned detections silently
 > fall back to the HSV wall mask in occupancy (§1.3's bug, in a new place).
 
@@ -725,7 +823,8 @@ don't assume.
 ### T-14 · Distil to a smaller model `[optional]`
 
 Once accuracy holds, retrain as `yolo11n-seg` for CPU/edge speed.
-`yoloe-11l-seg` + two scales is heavy for a CPU-only deployment.
+`yoloe-11l-seg` (plus a two-scale comparison on each scene's first frame) is
+heavy for a CPU-only deployment.
 
 ---
 
@@ -735,8 +834,8 @@ Once accuracy holds, retrain as `yolo11n-seg` for CPU/edge speed.
 
 **Why.** Count the hand-tuned constants currently deciding a fill percentage:
 weights `0.55/0.25/0.20`, the `2.5×` fallback amplification
-(`occupancy.py:149,152`), the 5% opening sanity check (line 145), overflow
-tiers `>15%→100 / >5%→80 / >1%→50` (lines 254–259), `openvocab_contain_frac`
+(`occupancy.py:179,182`), the 5% opening sanity check (line 175), overflow
+tiers `>15%→100 / >5%→80 / >1%→50` (lines 291–296), `openvocab_contain_frac`
 0.85, `waste_overflow_band_ratio` 0.45, the Canny thresholds `50,150`
 (`waste_detector.py:215`). Every one is a guess, and they interact badly — the
 texture gate fixed `001.jpg` and broke the dumpsters; the connectivity gate did
@@ -778,7 +877,7 @@ hierarchy for two options.**
 than admitting ignorance, and abstained frames are exactly the ones worth
 routing to human review and folding back into training.
 
-> Adding `UNCERTAIN` touches `FillStatus` (`settings.py:35`), `STATUS_COLORS`,
+> Adding `UNCERTAIN` touches `FillStatus` (`settings.py:34`), `STATUS_COLORS`,
 > `STATUS_COLORS_HEX`, `fill_thresholds`, and `classify_fill()`. Grep for
 > `FillStatus.` before adding — `ui/components.py` and `utils/drawing.py` both
 > switch on it.
@@ -798,7 +897,7 @@ architecture doesn't foreclose them:
 CCTV cameras are static; nothing in the codebase uses that:
 
 - **Bin positions don't move.** Configure ROIs once per camera and localisation
-  stops being a per-frame problem. The manual-ROI path (`bin_detector.py:432`)
+  stops being a per-frame problem. The manual-ROI path (`bin_detector.py:459`)
   already does this — it just needs per-camera persistence instead of
   per-session state.
 - **Reference-frame differencing.** Capture each bin empty, once. Fill becomes
@@ -880,7 +979,7 @@ T-13  fine-tune bin model           ~1 day    needs T-01, T-10                  
       dead-code removal (§4, HSV cluster)     after T-13 validates                 OPEN
 T-05  tighten Test 1                ~5 min    after T-13                           OPEN (blocked on T-01 per its own text)
 T-15  fill classifier               ~2 days   needs T-01, T-13                     OPEN
-T-08  revisit inference cost        —         after T-13                          OPEN (deferred)
+T-08  revisit inference cost        —         after T-13                          OPEN (deferred; partly addressed 2026-10-02 — scale cached per scene)
 T-16  fixed-camera exploitation     —         when video work resumes             OPEN (deferred)
 T-20  depth / sensor                —         only if T-15 plateaus               OPEN
 ```
@@ -906,15 +1005,18 @@ no one can say whether a change helped.
 |---|---|---|
 | `openvocab_enabled` | `True` | `False` reverts to the HSV heuristic |
 | `openvocab_conf` | `0.15` | Lower = more bins, more false positives |
-| `openvocab_scales` | `(640, 1280)` | See §2.3 before changing |
+| `openvocab_prompts` | 7 bin terms | Changing it invalidates the baked weights → automatic re-bake (§2.3) |
+| `openvocab_scales` | `(640, 1280)` | Compared once per scene, winner cached. See §2.3 before changing |
 | `bin_model_path` | `""` | Set this to activate a fine-tuned model (T-13) |
 | `area_weight` / `height_weight` / `overflow_weight` | `0.55/0.25/0.20` | Fill factor weights |
-| `waste_overflow_band_ratio` | `0.45` | Fraction of bin height searched above the rim |
+| `height_row_min_frac` | `0.08` | A fill-height row counts once waste covers this fraction of the bin's width |
+| `waste_overflow_band_ratio` | `0.45` | Fraction of bin height searched above the rim — also the height of the occupancy overflow band |
 | `waste_overflow_edge_gate` | `True` | Texture gate on the overflow band |
 | `waste_overflow_require_contact` | `False` | Stricter gate — only for downward-angled cameras (§1.2) |
 | `smoothing_window` | `5` | Frames in the rolling fill window (median, since T-03) |
 | `smoothing_enabled` | `True` | Added by T-03. `False` for stills (set automatically by `handle_image`) |
-| `frame_skip` | `3` | Run full pipeline every N frames (video only) |
+| `frame_skip` | `3` | Run full pipeline every N frames (frames 1, 4, 7, … — frame 1 always runs). Video files and headless runs skip after reading; dashboard webcam/RTSP skip with `grab()`; headless `--output` video is written at source fps ÷ `frame_skip` |
+| `csv_flush_interval` | `100` | Rows buffered before appending to the session CSV; memory keeps only the last 200 after a flush |
 
 ### Test suite
 
@@ -929,6 +1031,8 @@ no one can say whether a change helped.
 | 4 | Manual ROI path | Manual boxes → detect → clear → auto resumes |
 | 5 | Overflow override | Tiered fill-minimum logic |
 | 6 | Additional fixtures | Every other image in `tests/fixtures/` runs clean |
+| 7 | Occupancy invariants | Fill tiers have no gaps (rounded before matching); overflow score independent of frame width and bin position |
+| 8 | Open-vocab scale caching | Frame 2 runs only the cached scale with identical boxes; `reset_tracking()` clears it |
 
 Adding a fixture image to `tests/fixtures/` is picked up automatically by
 Test 6 — no code change.
@@ -937,10 +1041,14 @@ Test 6 — no code change.
 
 | File | Size | Role |
 |---|---|---|
-| `yolo11n-seg.pt` | 6 MB | Waste segmentation (COCO-pretrained) |
-| `yoloe-11l-seg.pt` | 71 MB | Open-vocab bin detection |
-| `mobileclip_blt.ts` | 600 MB | Text encoder for YOLOE prompts |
+| `yolo11n-seg.pt` | 6 MB | Waste segmentation (COCO-pretrained) — shipped in the repo |
+| `yoloe-11l-seg.pt` | 68 MB | Open-vocab bin detection (base weights) |
+| `yoloe-11l-seg-bins.pt` | 68 MB | Same, with the prompts baked in — generated on first use (§2.3) |
+| `mobileclip_blt.ts` | 572 MB | Text encoder for YOLOE prompts — only needed to (re-)bake |
 | `models/yolov8n-seg.pt` | 7 MB | Spare waste model, not referenced by code |
 
-The first three are auto-downloaded by Ultralytics on first run; they are not
-pip packages and are not in version control.
+`yoloe-11l-seg.pt` and `mobileclip_blt.ts` are auto-downloaded by Ultralytics
+on first use (not at launch); the baked file is generated from them. All three
+are gitignored and none is a pip package. After the first bake
+`mobileclip_blt.ts` can be deleted; it is needed again only if
+`openvocab_prompts` changes.

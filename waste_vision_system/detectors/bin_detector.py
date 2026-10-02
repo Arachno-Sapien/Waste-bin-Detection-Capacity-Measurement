@@ -11,8 +11,9 @@ Detection strategies, tried in this order in ``detect()``:
    Settings.bin_model_path.
 
 3. **Open-vocabulary (YOLOE)**: locates bins from text prompts
-   (see Settings.openvocab_*) with no bin-specific training. Runs at two
-   input scales and keeps whichever produces the cleaner box set — see
+   (see Settings.openvocab_*) with no bin-specific training. On a scene's
+   first frame, runs at two input scales and keeps whichever produces the
+   cleaner box set; later frames reuse that scale — see
    ``_detect_openvocab`` / ``_messiness``. Default strategy today.
 
 4. **HSV colour segmentation**: legacy heuristic, matches bins by body
@@ -25,8 +26,10 @@ A lightweight IoU-based tracker assigns persistent ``Bin #N`` IDs.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -132,6 +135,7 @@ class BinDetector:
         self._model_loaded = False
         self._ov_model = None
         self._ov_loaded = False
+        self._ov_scale: Optional[int] = None  # Winning YOLOE imgsz for the current scene
         self._use_segmentation = False
         self._manual_rois: List[Tuple[int, int, int, int]] = []
 
@@ -144,7 +148,7 @@ class BinDetector:
 
         model_path = self._settings.bin_model_path
         if not model_path:
-            logger.info("No bin model specified; using HSV colour segmentation")
+            logger.info("No bin model specified; using open-vocab / HSV strategies")
             self._model_loaded = True
             return
 
@@ -243,8 +247,9 @@ class BinDetector:
         """
         Detect bins by text prompt, with no bin-specific training.
 
-        Runs each configured input scale, keeps the cleanest result (see
-        _messiness), and turns the instance masks into BinDetection objects.
+        On a scene's first frame, runs each configured input scale and keeps
+        the cleanest result (see _messiness); later frames reuse that scale.
+        Turns the instance masks into BinDetection objects.
         The segmentation mask is the bin's own surface, which downstream
         occupancy uses directly as the wall mask — far more reliable than
         matching wall colour against a fixed HSV range.
@@ -253,8 +258,15 @@ class BinDetector:
         if model is None:
             return []
 
+        # The best scale depends on how big the bins are in frame, which is
+        # fixed for a scene — so compare all scales on the scene's first frame
+        # and reuse the winner until reset_tracking() (new upload / stream).
+        # ponytail: one pick per scene; re-pick every N frames if a single
+        # stream pans/zooms or cuts between cameras.
+        scales = (self._ov_scale,) if self._ov_scale else self._settings.openvocab_scales
+
         candidates = []
-        for imgsz in self._settings.openvocab_scales:
+        for imgsz in scales:
             try:
                 res = model.predict(
                     frame,
@@ -262,6 +274,7 @@ class BinDetector:
                     imgsz=imgsz,
                     iou=self._settings.openvocab_nms_iou,
                     agnostic_nms=True,
+                    retina_masks=True,  # masks at frame size, not letterboxed
                     device=self._settings.resolve_device(),
                     verbose=False,
                 )[0]
@@ -279,20 +292,23 @@ class BinDetector:
                     continue
                 mask = None
                 if res.masks is not None and i < len(res.masks):
-                    raw = res.masks[i].data.cpu().numpy().squeeze()
-                    mask = cv2.resize(raw, (w, h), interpolation=cv2.INTER_NEAREST)
-                    mask = (mask > 0.5).astype(np.uint8)
+                    mask = (res.masks[i].data.cpu().numpy().squeeze() > 0.5).astype(np.uint8)
                 items.append((float(res.boxes.conf[i]), box, mask))
 
             kept = self._dedupe_boxes(items)
-            candidates.append((self._messiness(kept), -len(kept), kept))
+            candidates.append((not kept, round(self._messiness(kept), 2), -len(kept), imgsz, kept))
 
         if not candidates:
+            self._ov_scale = None
             return []
 
-        # Cleanest scale wins; near-ties break toward the one finding more bins.
-        candidates.sort(key=lambda c: (round(c[0], 2), c[1]))
-        kept = candidates[0][2]
+        # A scale that found bins beats one that found none (an empty set is
+        # trivially "clean"); then the cleanest scale wins; near-ties break
+        # toward the one finding more bins.
+        candidates.sort(key=lambda c: c[:3])
+        _, _, _, imgsz, kept = candidates[0]
+        # Cache only a scale that found bins; otherwise re-compare next frame.
+        self._ov_scale = imgsz if kept else None
         if not kept:
             return []
 
@@ -345,17 +361,30 @@ class BinDetector:
             from ultralytics import YOLOE
 
             prompts = list(self._settings.openvocab_prompts)
-            logger.info("Loading open-vocab bin model: %s",
-                        self._settings.openvocab_model_path)
-            model = YOLOE(self._settings.openvocab_model_path)
-            model.set_classes(prompts, model.get_text_pe(prompts))
+            model_path = Path(self._settings.openvocab_model_path)
+            # Weights with the prompt embeddings baked in: loading these needs
+            # no text encoder (mobileclip_blt.ts, ~572MB) and skips the 2–7s
+            # prompt encoding. Re-baked whenever openvocab_prompts changes.
+            baked = model_path.with_name(f"{model_path.stem}-bins.pt")
+            model = YOLOE(str(baked)) if baked.exists() else None
+            if model is None or list(model.names.values()) != prompts:
+                logger.info("Baking open-vocab prompts into %s", baked)
+                model = YOLOE(str(model_path))
+                # Ultralytics looks for the text encoder in the CWD and
+                # re-downloads it if missing; it ships next to the weights.
+                with contextlib.chdir(model_path.parent):
+                    model.set_classes(prompts, model.get_text_pe(prompts))
+                tmp = baked.with_suffix(".tmp")
+                model.save(str(tmp))
+                tmp.replace(baked)  # never leave a half-written .pt behind
+            logger.info("Loaded open-vocab bin model: %s", baked)
             self._ov_model = model
         except Exception as e:
             logger.error("Open-vocab model unavailable (%s); falling back to HSV", e)
             self._ov_model = None
         return self._ov_model
 
-    # ---- YOLO strategy (unchanged) ----------------------------------------
+    # ---- Custom YOLO model strategy ----------------------------------------
 
     def _detect_yolo(self, frame: np.ndarray, h: int, w: int) -> List[BinDetection]:
         """Use YOLO to detect bins and extract interior masks."""
@@ -365,6 +394,7 @@ class BinDetector:
             conf=self._settings.confidence_threshold,
             iou=self._settings.iou_threshold,
             imgsz=self._settings.input_size,
+            retina_masks=True,  # masks at frame size, not letterboxed
             device=device,
             verbose=False,
         )
@@ -389,9 +419,7 @@ class BinDetector:
 
             seg_mask = None
             if self._use_segmentation and result.masks is not None and i < len(result.masks):
-                raw_mask = result.masks[i].data.cpu().numpy().squeeze()
-                seg_mask = cv2.resize(raw_mask, (w, h), interpolation=cv2.INTER_NEAREST)
-                seg_mask = (seg_mask > 0.5).astype(np.uint8)
+                seg_mask = (result.masks[i].data.cpu().numpy().squeeze() > 0.5).astype(np.uint8)
                 k = self._settings.bin_interior_erode_kernel
                 kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
                 seg_mask = cv2.erode(seg_mask, kernel, iterations=1)
@@ -955,5 +983,6 @@ class BinDetector:
         return mask
 
     def reset_tracking(self) -> None:
-        """Reset all track IDs."""
+        """New scene: reset track IDs and re-pick the open-vocab scale."""
         self._tracker.reset()
+        self._ov_scale = None

@@ -141,8 +141,7 @@ def process_frame(
     settings: Settings,
 ) -> np.ndarray:
     """
-    Run the full 8-step pipeline on a single frame and return the
-    annotated frame.
+    Run the full pipeline on a single frame and return the annotated frame.
     """
     fps_counter.tick()
     annotated = frame.copy()
@@ -222,14 +221,16 @@ def handle_image(source, pipeline):
     settings.smoothing_enabled = False
 
     # ---- Decode image (only once per upload) ----
-    if st.session_state.get("_img_upload_id") != id(source):
+    # file_id is stable across reruns; id(source) is not — Streamlit builds a
+    # new UploadedFile object every rerun, which used to wipe the ROI editor.
+    if st.session_state.get("_img_upload_id") != source.file_id:
         source.seek(0)
         file_bytes = np.frombuffer(source.read(), dtype=np.uint8)
         frame = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
         if frame is None:
             st.error("Failed to decode image. Please upload a valid image file.")
             return
-        st.session_state["_img_upload_id"] = id(source)
+        st.session_state["_img_upload_id"] = source.file_id
         st.session_state["original_frame"] = frame.copy()
         # Reset edit mode on new upload
         st.session_state["edit_mode"] = False
@@ -268,7 +269,7 @@ def handle_image(source, pipeline):
     # ---- Display results ----
     col_img, col_status = st.columns([3, 1])
     with col_img:
-        st.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), use_container_width=True)
+        st.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), width="stretch")
     with col_status:
         st.markdown("### Detection Results")
         for bin_d, occ, _ in st.session_state["last_results"]:
@@ -291,12 +292,12 @@ def handle_image(source, pipeline):
     # Toggle buttons
     btn_cols = st.columns(3)
     with btn_cols[0]:
-        if st.button("✏️ Edit Bin Selection", key="btn_edit_roi", use_container_width=True):
+        if st.button("✏️ Edit Bin Selection", key="btn_edit_roi", width="stretch"):
             st.session_state["edit_mode"] = True
             st.rerun()
     with btn_cols[1]:
         if using_manual:
-            if st.button("🤖 Reset to AI Detection", key="btn_reset_roi", use_container_width=True):
+            if st.button("🤖 Reset to AI Detection", key="btn_reset_roi", width="stretch"):
                 st.session_state["manual_rois"] = []
                 st.session_state["edit_mode"] = False
                 bin_det.clear_manual_rois()
@@ -340,7 +341,7 @@ def handle_image(source, pipeline):
 
         st.image(cv2.cvtColor(ref_img, cv2.COLOR_BGR2RGB),
                  caption="Reference: Blue = AI detections, Green = your manual selections",
-                 use_container_width=True)
+                 width="stretch")
 
         # ROI input form
         with st.form("roi_form", clear_on_submit=True):
@@ -357,7 +358,7 @@ def handle_image(source, pipeline):
 
             form_cols = st.columns(3)
             with form_cols[0]:
-                add_btn = st.form_submit_button("➕ Add Bin", use_container_width=True)
+                add_btn = st.form_submit_button("➕ Add Bin", width="stretch")
 
             if add_btn:
                 if new_x2 > new_x1 and new_y2 > new_y1:
@@ -390,11 +391,11 @@ def handle_image(source, pipeline):
         with act_cols[0]:
             if current_rois:
                 if st.button("✅ Apply & Re-analyze", key="btn_apply_roi",
-                             use_container_width=True, type="primary"):
+                             width="stretch", type="primary"):
                     st.session_state["edit_mode"] = False
                     st.rerun()
         with act_cols[1]:
-            if st.button("❌ Cancel", key="btn_cancel_roi", use_container_width=True):
+            if st.button("❌ Cancel", key="btn_cancel_roi", width="stretch"):
                 st.session_state["edit_mode"] = False
                 st.rerun()
 
@@ -410,6 +411,7 @@ def handle_video(source, pipeline):
         tmp_path = tmp.name
 
     if not stream.open(tmp_path):
+        Path(tmp_path).unlink(missing_ok=True)
         st.error("Failed to open video file.")
         return
 
@@ -430,34 +432,39 @@ def handle_video(source, pipeline):
     total = stream.total_frames if stream.total_frames > 0 else 1
     frame_idx = 0
 
-    while not stop_btn:
-        ret, frame = stream.read(skip_frames=False)
-        if not ret:
-            break
+    # finally: any widget click reruns the script by raising inside this loop,
+    # which used to leave the capture open and the temp copy on disk.
+    try:
+        while not stop_btn:
+            ret, frame = stream.read(skip_frames=False)
+            if not ret:
+                break
 
-        frame_idx += 1
+            frame_idx += 1
 
-        # Process only every Nth frame for speed
-        if frame_idx % settings.frame_skip != 0:
+            # Process only every Nth frame for speed (always including frame 1)
+            if (frame_idx - 1) % settings.frame_skip != 0:
+                progress_bar.progress(min(frame_idx / total, 1.0))
+                continue
+
+            annotated = process_frame(
+                frame, bin_det, waste_det, occ_est, data_log, fps_cnt, settings
+            )
+
+            frame_placeholder.image(
+                cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
+                width="stretch",
+            )
+
+            with status_placeholder.container():
+                for bin_d, occ, _ in st.session_state["last_results"]:
+                    render_status_card(occ.bin_id, occ.fill_pct, occ.status, bin_d.confidence)
+
             progress_bar.progress(min(frame_idx / total, 1.0))
-            continue
+    finally:
+        stream.release()
+        Path(tmp_path).unlink(missing_ok=True)
 
-        annotated = process_frame(
-            frame, bin_det, waste_det, occ_est, data_log, fps_cnt, settings
-        )
-
-        frame_placeholder.image(
-            cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
-            use_container_width=True,
-        )
-
-        with status_placeholder.container():
-            for bin_d, occ, _ in st.session_state["last_results"]:
-                render_status_card(occ.bin_id, occ.fill_pct, occ.status, bin_d.confidence)
-
-        progress_bar.progress(min(frame_idx / total, 1.0))
-
-    stream.release()
     progress_bar.progress(1.0)
     st.success(f"Processed {frame_idx} frames")
 
@@ -485,27 +492,30 @@ def handle_webcam(cam_idx: int, pipeline):
 
     stop_btn = st.button("Stop Webcam", key="stop_webcam")
 
-    while not stop_btn and st.session_state.get("running", True):
-        ret, frame = stream.read(skip_frames=True)
-        if not ret:
-            time.sleep(0.01)
-            continue
+    # finally: the sidebar Stop button reruns the script by raising inside this
+    # loop; without it the camera stayed open (and locked) after stopping.
+    try:
+        while not stop_btn and st.session_state.get("running", True):
+            ret, frame = stream.read(skip_frames=True)
+            if not ret:
+                time.sleep(0.01)
+                continue
 
-        annotated = process_frame(
-            frame, bin_det, waste_det, occ_est, data_log, fps_cnt, settings
-        )
+            annotated = process_frame(
+                frame, bin_det, waste_det, occ_est, data_log, fps_cnt, settings
+            )
 
-        frame_placeholder.image(
-            cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
-            use_container_width=True,
-        )
+            frame_placeholder.image(
+                cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
+                width="stretch",
+            )
 
-        with status_placeholder.container():
-            render_fps_indicator(fps_cnt.fps, fps_cnt.latency_ms)
-            for bin_d, occ, _ in st.session_state["last_results"]:
-                render_status_card(occ.bin_id, occ.fill_pct, occ.status, bin_d.confidence)
-
-    stream.release()
+            with status_placeholder.container():
+                render_fps_indicator(fps_cnt.fps, fps_cnt.latency_ms)
+                for bin_d, occ, _ in st.session_state["last_results"]:
+                    render_status_card(occ.bin_id, occ.fill_pct, occ.status, bin_d.confidence)
+    finally:
+        stream.release()
 
 
 def handle_rtsp(uri: str, pipeline):
@@ -534,29 +544,31 @@ def handle_rtsp(uri: str, pipeline):
 
     stop_btn = st.button("Disconnect", key="stop_rtsp")
 
-    while not stop_btn and st.session_state.get("running", True):
-        ret, frame = stream.read(skip_frames=True)
-        if not ret:
-            if stream.is_reconnecting:
-                frame_placeholder.warning("Reconnecting to RTSP stream...")
-            time.sleep(0.1)
-            continue
+    # finally: see handle_webcam — a rerun raises inside this loop.
+    try:
+        while not stop_btn and st.session_state.get("running", True):
+            ret, frame = stream.read(skip_frames=True)
+            if not ret:
+                if stream.is_reconnecting:
+                    frame_placeholder.warning("Reconnecting to RTSP stream...")
+                time.sleep(0.1)
+                continue
 
-        annotated = process_frame(
-            frame, bin_det, waste_det, occ_est, data_log, fps_cnt, settings
-        )
+            annotated = process_frame(
+                frame, bin_det, waste_det, occ_est, data_log, fps_cnt, settings
+            )
 
-        frame_placeholder.image(
-            cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
-            use_container_width=True,
-        )
+            frame_placeholder.image(
+                cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
+                width="stretch",
+            )
 
-        with status_placeholder.container():
-            render_fps_indicator(fps_cnt.fps, fps_cnt.latency_ms)
-            for bin_d, occ, _ in st.session_state["last_results"]:
-                render_status_card(occ.bin_id, occ.fill_pct, occ.status, bin_d.confidence)
-
-    stream.release()
+            with status_placeholder.container():
+                render_fps_indicator(fps_cnt.fps, fps_cnt.latency_ms)
+                for bin_d, occ, _ in st.session_state["last_results"]:
+                    render_status_card(occ.bin_id, occ.fill_pct, occ.status, bin_d.confidence)
+    finally:
+        stream.release()
 
 
 # ---------------------------------------------------------------------------
@@ -637,11 +649,11 @@ def main():
     if _s.bin_model_path:
         bin_model_label = _s.bin_model_path
     elif _s.openvocab_enabled:
-        bin_model_label = f"{_s.openvocab_model_path} (open-vocab)"
+        bin_model_label = f"{Path(_s.openvocab_model_path).name} (open-vocab)"
     else:
         bin_model_label = 'HSV Colour Segmentation'
     st.sidebar.markdown(f"**Model (Bin):** `{bin_model_label}`")
-    st.sidebar.markdown(f"**Model (Waste):** `{st.session_state['settings'].waste_model_path}`")
+    st.sidebar.markdown(f"**Model (Waste):** `{Path(_s.waste_model_path).name}`")
     render_fps_indicator(fps_cnt.fps, fps_cnt.latency_ms)
 
     # ---- Handle export buttons ----
@@ -705,7 +717,7 @@ def main():
     if data_log.entry_count > 0:
         with st.expander("Audit Log (Recent Entries)", expanded=False):
             df = data_log.get_dataframe()
-            st.dataframe(df.tail(50), use_container_width=True)
+            st.dataframe(df.tail(50), width="stretch")
 
 
 if __name__ == "__main__":

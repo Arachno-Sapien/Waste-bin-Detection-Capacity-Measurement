@@ -181,14 +181,19 @@ class OccupancyEstimator:
             # No color mask available — use conventional ratio with amplification
             area_ratio = min(100.0, (waste_pixel_count / bin_pixel_count) * 100.0 * 2.5)
 
+        # Factors 2 and 3 look only at the bin's own columns, so the scores
+        # don't depend on how wide the frame is around the bin.
+        cols = np.flatnonzero(interior_mask.any(axis=0))
+        bin_cols = waste_union[:, cols[0]:cols[-1] + 1]
+
         # --- Factor 2: Vertical Fill Height ---
         height_ratio = self._compute_vertical_fill(
-            waste_union, rim_top_y, rim_bottom_y
+            bin_cols, rim_top_y, rim_bottom_y
         )
 
         # --- Factor 3: Overflow Detection ---
         overflow_score = self._compute_overflow(
-            waste_union, rim_top_y, w
+            bin_cols, rim_top_y, rim_bottom_y
         )
 
         # --- Combined fill percentage ---
@@ -237,7 +242,7 @@ class OccupancyEstimator:
         row_sums = np.sum(strip > 0, axis=1)
 
         # Find the highest row (smallest index from top) with waste
-        threshold = strip.shape[1] * 0.02  # At least 2% of row width
+        threshold = strip.shape[1] * self._settings.height_row_min_frac
         waste_rows = np.where(row_sums > threshold)[0]
 
         if len(waste_rows) == 0:
@@ -255,7 +260,7 @@ class OccupancyEstimator:
         self,
         waste_mask: np.ndarray,
         rim_top_y: int,
-        frame_width: int,
+        rim_bottom_y: int,
     ) -> float:
         """
         Check for waste pixels ABOVE the bin rim.  If significant waste
@@ -264,8 +269,10 @@ class OccupancyEstimator:
         if rim_top_y <= 0:
             return 0.0
 
-        # Look at the region above the rim (up to 30% of rim_top_y)
-        check_height = max(10, rim_top_y // 3)
+        # Look at the same band above the rim that WasteDetector searched,
+        # sized by the bin's height (not by where the bin sits in the frame).
+        bin_height = max(rim_bottom_y - rim_top_y, 1)
+        check_height = max(10, int(bin_height * self._settings.waste_overflow_band_ratio))
         above_start = max(0, rim_top_y - check_height)
 
         above_region = waste_mask[above_start:rim_top_y, :]

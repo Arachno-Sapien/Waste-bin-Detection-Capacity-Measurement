@@ -296,7 +296,6 @@ class WasteDetector:
         if self._model is not None:
             crop = frame[y1:y2, x1:x2]
             if crop.size > 0:
-                crop_h, crop_w = crop.shape[:2]
                 device = self._settings.resolve_device()
 
                 results = self._model(
@@ -304,6 +303,7 @@ class WasteDetector:
                     conf=self._settings.confidence_threshold,
                     iou=self._settings.iou_threshold,
                     imgsz=self._settings.input_size,
+                    retina_masks=True,  # masks at crop size, not letterboxed
                     device=device,
                     verbose=False,
                 )
@@ -336,13 +336,9 @@ class WasteDetector:
                             full_mask = np.zeros((h, w), dtype=np.uint8)
                             if (self._has_seg_masks and result.masks is not None
                                     and i < len(result.masks)):
-                                raw_mask = result.masks[i].data.cpu().numpy().squeeze()
-                                crop_mask = cv2.resize(
-                                    raw_mask, (crop_w, crop_h),
-                                    interpolation=cv2.INTER_NEAREST
+                                full_mask[y1:y2, x1:x2] = (
+                                    result.masks[i].data.cpu().numpy().squeeze() > 0.5
                                 )
-                                crop_mask = (crop_mask > 0.5).astype(np.uint8)
-                                full_mask[y1:y2, x1:x2] = crop_mask
                             else:
                                 full_mask[fy1:fy2, fx1:fx2] = 1
 

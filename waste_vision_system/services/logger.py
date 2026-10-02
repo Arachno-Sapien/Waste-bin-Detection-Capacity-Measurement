@@ -1,8 +1,8 @@
 """
 Data Logger — CSV export and snapshot persistence
 ===================================================
-Stores per-frame occupancy readings in an in-memory DataFrame with
-periodic auto-flush to disk, and supports timestamped JPEG snapshots.
+Buffers per-frame occupancy readings in memory, appends them to the session
+CSV periodically, and supports timestamped JPEG snapshots.
 """
 
 from __future__ import annotations
@@ -25,8 +25,9 @@ class DataLogger:
     """
     Audit-trail logger for bin occupancy readings.
 
-    Maintains an in-memory DataFrame and flushes to CSV at configurable
-    intervals.  Also supports saving annotated frame snapshots.
+    Buffers records in memory and appends them to the session CSV every
+    ``csv_flush_interval`` rows; only the recent rows stay in memory.
+    Also supports saving annotated frame snapshots.
     """
 
     _COLUMNS = [
@@ -36,11 +37,12 @@ class DataLogger:
         "status",
         "confidence",
     ]
+    _KEEP_IN_MEMORY = 200  # Recent rows kept after a flush, for the UI audit view
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._records: list[dict] = []
-        self._flush_counter: int = 0
+        self._pending: int = 0  # Newest records not yet written to disk
         self._session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._csv_path = CSV_DIR / f"session_{self._session_id}.csv"
 
@@ -81,30 +83,29 @@ class DataLogger:
             "confidence": round(confidence, 2),
         })
 
-        self._flush_counter += 1
-        if self._flush_counter >= self._settings.csv_flush_interval:
+        self._pending += 1
+        if self._pending >= self._settings.csv_flush_interval:
             self._auto_flush()
 
-    def export_csv(self, path: Optional[str] = None) -> Path:
+    def export_csv(self) -> Path:
         """
-        Export the full audit log to a CSV file.
+        Append not-yet-written records to the session CSV inside exports/csv/
+        and return its path. The file always holds the full session log.
 
-        Parameters
-        ----------
-        path : str, optional
-            Custom output path.  Defaults to the session CSV inside exports/csv/.
-
-        Returns
-        -------
-        Path
-            Absolute path to the written CSV file.
+        Appending (rather than rewriting everything each flush) keeps disk I/O
+        constant on long webcam/RTSP sessions, and lets memory hold only the
+        recent rows the UI shows.
         """
-        out = Path(path) if path else self._csv_path
+        out = self._csv_path
         out.parent.mkdir(parents=True, exist_ok=True)
 
-        df = pd.DataFrame(self._records, columns=self._COLUMNS)
-        df.to_csv(out, index=False)
-        logger.info("Exported CSV with %d entries to %s", len(df), out)
+        new = self._records[len(self._records) - self._pending:]
+        pd.DataFrame(new, columns=self._COLUMNS).to_csv(
+            out, mode="a", header=not out.exists(), index=False
+        )
+        self._pending = 0
+        del self._records[:-self._KEEP_IN_MEMORY]
+        logger.info("Appended %d entries to %s", len(new), out)
         return out
 
     def save_snapshot(
@@ -132,7 +133,7 @@ class DataLogger:
         return out_path
 
     def get_dataframe(self) -> pd.DataFrame:
-        """Return the current records as a DataFrame."""
+        """Return the recent in-memory records as a DataFrame (full log is the CSV)."""
         return pd.DataFrame(self._records, columns=self._COLUMNS)
 
     @property
@@ -142,7 +143,7 @@ class DataLogger:
     def clear(self) -> None:
         """Discard all in-memory records."""
         self._records.clear()
-        self._flush_counter = 0
+        self._pending = 0
 
     # ---- Internal ----------------------------------------------------------
 
@@ -150,6 +151,5 @@ class DataLogger:
         """Periodically write records to disk to prevent memory buildup."""
         try:
             self.export_csv()
-            self._flush_counter = 0
         except Exception as e:
             logger.error("Auto-flush failed: %s", e)

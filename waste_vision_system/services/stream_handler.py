@@ -8,6 +8,7 @@ with automatic reconnection, frame-skipping, and buffer flushing.
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 import time
 from typing import Optional, Tuple, Union
@@ -156,8 +157,10 @@ class StreamHandler:
 
     def _open_capture(self) -> bool:
         """Open the cv2.VideoCapture (must be called under lock)."""
+        self.release_internal()  # A racing reconnect thread must not orphan a live capture
         try:
-            if isinstance(self._source, int):
+            if isinstance(self._source, int) and sys.platform == "win32":
+                # DirectShow opens Windows webcams fast; it doesn't exist elsewhere.
                 self._cap = cv2.VideoCapture(self._source, cv2.CAP_DSHOW)
             else:
                 self._cap = cv2.VideoCapture(self._source)

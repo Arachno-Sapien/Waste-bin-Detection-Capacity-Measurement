@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import cv2
@@ -70,7 +69,10 @@ def _run_headless(args: argparse.Namespace) -> None:
     if args.output:
         w, h = stream.frame_size
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(args.output, fourcc, stream.fps, (w, h))
+        # Only processed (annotated) frames are written, so scale the rate to
+        # keep real-time playback speed.
+        out_fps = stream.fps / settings.frame_skip
+        writer = cv2.VideoWriter(args.output, fourcc, out_fps, (w, h))
         print(f"[Waste Vision] Writing output to: {args.output}")
 
     frame_count = 0
@@ -82,10 +84,9 @@ def _run_headless(args: argparse.Namespace) -> None:
 
             frame_count += 1
 
-            # Skip frames for performance
-            if frame_count % settings.frame_skip != 0:
-                if writer:
-                    writer.write(frame)
+            # Skip frames for performance — but always process frame 1, or a
+            # single-image source is skipped entirely.
+            if (frame_count - 1) % settings.frame_skip != 0:
                 continue
 
             fps_cnt.tick()
