@@ -36,6 +36,7 @@ import cv2
 import numpy as np
 
 from config.settings import FillStatus, Settings
+from services.temporal import FillTimeline
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +102,7 @@ class OccupancyEstimator:
         self._history: Dict[int, Deque[float]] = defaultdict(
             lambda: deque(maxlen=settings.smoothing_window)
         )
+        self._timeline = FillTimeline(settings)
 
     def estimate(
         self,
@@ -110,6 +112,7 @@ class OccupancyEstimator:
         rim_top_y: int,
         rim_bottom_y: int,
         bin_color_mask: Optional[np.ndarray] = None,
+        occluded: bool = False,
     ) -> OccupancyResult:
         """
         Compute the fill percentage for a single bin.
@@ -129,6 +132,9 @@ class OccupancyEstimator:
         bin_color_mask : np.ndarray or None
             Binary mask of bin-wall-coloured pixels within the interior
             (full-frame). Used for aperture-focused estimation.
+        occluded : bool
+            A person covers the bin: report the current level but keep this
+            reading out of the smoothing history.
         """
         # --- Edge case: no interior mask ---
         if interior_mask is None or interior_mask.sum() == 0:
@@ -214,7 +220,7 @@ class OccupancyEstimator:
 
         return self._finalize(
             bin_id, raw_fill, area_ratio, height_ratio, overflow_score,
-            waste_pixel_count, bin_pixel_count,
+            waste_pixel_count, bin_pixel_count, occluded=occluded,
         )
 
     # ---- Factor 2: Vertical fill height -----------------------------------
@@ -307,12 +313,19 @@ class OccupancyEstimator:
         overflow_score: float,
         waste_pixel_count: int,
         bin_pixel_count: int,
+        occluded: bool = False,
     ) -> OccupancyResult:
         """Apply temporal smoothing and classify the fill state."""
-        if self._settings.smoothing_enabled:
-            self._history[bin_id].append(raw_fill)
-            window = self._history[bin_id]
-            smoothed = float(np.median(window))
+        if self._settings.smoothing_enabled and self._settings.temporal_mode == "monotonic":
+            level = self._timeline.level(bin_id)
+            if occluded and level is not None:
+                smoothed = level
+            else:
+                smoothed, _ = self._timeline.update(bin_id, raw_fill)
+        elif self._settings.smoothing_enabled:
+            if not (occluded and self._history[bin_id]):
+                self._history[bin_id].append(raw_fill)
+            smoothed = float(np.median(self._history[bin_id]))
         else:
             smoothed = raw_fill
 
@@ -332,6 +345,7 @@ class OccupancyEstimator:
 
     def reset(self, bin_id: Optional[int] = None) -> None:
         """Clear smoothing history for a specific bin or all bins."""
+        self._timeline.reset(bin_id)
         if bin_id is not None:
             self._history.pop(bin_id, None)
         else:

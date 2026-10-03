@@ -27,7 +27,9 @@ if str(_PACKAGE_ROOT) not in sys.path:
 from config.settings import Settings
 from detectors.bin_detector import BinDetector
 from detectors.waste_detector import WasteDetector
-from services.occupancy import OccupancyEstimator, wall_mask_for
+from config.cameras import load_references, load_rois, save_reference, save_rois
+from services.occupancy import OccupancyEstimator
+from services.pipeline import analyse_frame
 from services.stream_handler import StreamHandler
 from services.logger import DataLogger
 from utils.drawing import draw_bin_overlay, draw_hud_header, draw_no_detection
@@ -92,6 +94,8 @@ def _init_state() -> None:
         "edit_mode": False,
         "manual_rois": [],
         "_img_upload_id": None,
+        "raw_frame": None,        # last unannotated frame (for reference capture)
+        "camera_refs": None,      # empty-bin references of the active fixed camera
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -146,63 +150,30 @@ def process_frame(
     fps_counter.tick()
     annotated = frame.copy()
 
-    # Step 1 & 2: Detect bins + interior masks
-    bin_detections = bin_detector.detect(frame)
-
-    results_list = []
-
-    if not bin_detections:
+    results_list = analyse_frame(
+        frame, settings, bin_detector, waste_detector, occupancy_estimator,
+        references=st.session_state["camera_refs"],
+    )
+    if not results_list:
         draw_no_detection(annotated)
-    else:
-        # Pre-compute HSV for bin color mask generation
-        hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    for bin_det, occ, waste_dets in results_list:
+        draw_bin_overlay(annotated, bin_det, occ, waste_dets)
+        data_logger.log_entry(
+            bin_id=occ.bin_id,
+            fill_pct=occ.fill_pct,
+            status=occ.status,
+            confidence=bin_det.confidence,
+        )
 
-        for bin_det in bin_detections:
-            # Step 3: Detect waste inside bin
-            waste_dets = waste_detector.detect(
-                frame, bin_det.bbox, bin_det.interior_mask,
-                bin_color_name=getattr(bin_det, 'bin_color_name', 'unknown'),
-                bin_hsv_range=getattr(bin_det, 'bin_hsv_range', None),
-            )
-
-            # Build bin wall mask for aperture-focused occupancy: the
-            # detector's own surface mask if it made one, else an expanded
-            # HSV colour-range match.
-            bin_color_mask = wall_mask_for(bin_det, hsv_frame)
-
-            # Steps 4-6: Estimate occupancy
-            waste_masks = [wd.mask for wd in waste_dets]
-            occ = occupancy_estimator.estimate(
-                bin_id=bin_det.bin_id,
-                interior_mask=bin_det.interior_mask,
-                waste_masks=waste_masks,
-                rim_top_y=bin_det.rim_top_y,
-                rim_bottom_y=bin_det.rim_bottom_y,
-                bin_color_mask=bin_color_mask,
-            )
-
-            # Step 7: Draw overlay
-            draw_bin_overlay(annotated, bin_det, occ, waste_dets)
-
-            # Log
-            data_logger.log_entry(
-                bin_id=occ.bin_id,
-                fill_pct=occ.fill_pct,
-                status=occ.status,
-                confidence=bin_det.confidence,
-            )
-
-            results_list.append((bin_det, occ, waste_dets))
-
-    # HUD header
     draw_hud_header(
         annotated,
         fps=fps_counter.fps,
-        active_bins=len(bin_detections),
+        active_bins=len(results_list),
         latency_ms=fps_counter.latency_ms,
     )
 
     st.session_state["last_frame"] = annotated
+    st.session_state["raw_frame"] = frame
     st.session_state["last_results"] = results_list
 
     return annotated
@@ -212,6 +183,21 @@ def process_frame(
 # Mode handlers
 # ---------------------------------------------------------------------------
 
+def _use_fixed_camera(settings: Settings, enabled: bool) -> None:
+    """Webcam/RTSP with a Camera ID: use that camera's empty-bin references
+    and fill that only rises between collections. Uploads never do."""
+    cam_id = st.session_state.get("camera_id") if enabled else None
+    refs = None
+    if cam_id:
+        try:
+            refs = load_references(cam_id)
+        except ValueError as e:
+            st.warning(f"Camera ID ignored: {e}")
+            cam_id = None
+    st.session_state["camera_refs"] = refs
+    settings.temporal_mode = "monotonic" if cam_id else "median"
+
+
 def handle_image(source, pipeline):
     """Process a single uploaded image with optional manual bin boundary editing."""
     bin_det, waste_det, occ_est, _, data_log, fps_cnt = pipeline
@@ -219,6 +205,7 @@ def handle_image(source, pipeline):
     # A still has no temporal dimension; smoothing across Streamlit re-runs
     # only creates the state-leak bug T-02 fixes in a new place.
     settings.smoothing_enabled = False
+    _use_fixed_camera(settings, enabled=False)
 
     # ---- Decode image (only once per upload) ----
     # file_id is stable across reruns; id(source) is not — Streamlit builds a
@@ -420,6 +407,7 @@ def handle_video(source, pipeline):
     bin_det.reset_tracking()
     occ_est.reset()
     settings.smoothing_enabled = True
+    _use_fixed_camera(settings, enabled=False)
 
     st.markdown("### Video Processing")
 
@@ -483,6 +471,7 @@ def handle_webcam(cam_idx: int, pipeline):
     bin_det.reset_tracking()
     occ_est.reset()
     settings.smoothing_enabled = True
+    _use_fixed_camera(settings, enabled=True)
 
     st.markdown("### Live Webcam Feed")
 
@@ -535,6 +524,7 @@ def handle_rtsp(uri: str, pipeline):
     bin_det.reset_tracking()
     occ_est.reset()
     settings.smoothing_enabled = True
+    _use_fixed_camera(settings, enabled=True)
 
     st.success("Connected successfully!")
 
@@ -602,6 +592,31 @@ def main():
     if mode in ("webcam", "rtsp"):
         st.sidebar.markdown("---")
         st.sidebar.markdown("### Manual Bin Regions")
+        cam_id = st.sidebar.text_input(
+            "Camera ID (fixed camera)", key="camera_id",
+            help="Letters, digits, _ and -. ROIs and empty-bin references are "
+                 "saved under config/cameras/<id>/.")
+        raw = st.session_state.get("raw_frame")
+        if cam_id and raw is not None:
+            size = (raw.shape[1], raw.shape[0])
+            try:
+                c_load, c_save = st.sidebar.columns(2)
+                if c_load.button("Load ROIs", key="cam_load"):
+                    st.session_state["manual_rois"] = load_rois(cam_id, size)
+                    st.rerun()
+                if c_save.button("Save ROIs", key="cam_save") and st.session_state.get("manual_rois"):
+                    save_rois(cam_id, st.session_state["manual_rois"], size)
+                    st.sidebar.success("ROIs saved")
+                tag = st.sidebar.selectbox("Lighting", ["day", "night", "ir"], key="ref_tag")
+                if st.sidebar.button("Capture empty reference", key="cam_ref",
+                                     help="Only while every bin is empty"):
+                    band = st.session_state["settings"].waste_overflow_band_ratio
+                    for i, roi in enumerate(st.session_state.get("manual_rois", [])):
+                        x1, y1, x2, y2 = WasteDetector.search_region(roi, raw.shape, band)
+                        save_reference(cam_id, i, raw[y1:y2, x1:x2], tag)
+                    st.sidebar.success("Empty references saved")
+            except ValueError as e:
+                st.sidebar.error(str(e))
         manual_rois = st.session_state.get("manual_rois", [])
         if manual_rois:
             st.sidebar.success(f"Using {len(manual_rois)} manual ROI(s)")

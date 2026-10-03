@@ -364,6 +364,114 @@ def test_scale_caching():
     return True
 
 
+def test_eval_metrics():
+    """
+    Test 9: evaluate.py box matching and metrics (no model needed)
+    """
+    print("\n--- Running Test 9: Evaluation Metrics ---")
+    from evaluate import match, summarise
+    gt = [(0, 0, 10, 10), (20, 0, 30, 10)]
+    pred = [(21, 0, 31, 10), (100, 100, 110, 110), (0, 0, 9, 10)]
+    assert sorted(match(pred, gt)) == [(0, 1), (2, 0)], match(pred, gt)
+
+    # (predicted tier or None = abstained, true class); 4 = FULL
+    rows = [{"n_pred": 3, "n_gt": 2, "matches": [(4, 4), (2, 1)]},
+            {"n_pred": 1, "n_gt": 1, "matches": [(None, 4)]}]
+    m = summarise(rows)
+    assert (m["precision"], m["recall"], m["count_accuracy"]) == (0.75, 1.0, 0.5), m
+    assert (m["tier_accuracy"], m["within_one_tier"], m["abstain_rate"]) == (0.333, 0.667, 0.333), m
+    assert (m["full_recall"], m["mae_pct"]) == (0.5, 10.0), m
+    print("Test 9 PASSED")
+    return True
+
+
+def test_tracker_grace():
+    """
+    Test 10: a bin hidden for a few frames keeps its ID; one gone longer
+    than track_max_age gets a new ID.
+    """
+    print("\n--- Running Test 10: Tracker Grace Period ---")
+    from detectors.bin_detector import _SimpleTracker
+    t = _SimpleTracker(max_age=2)
+    a, b = (0, 0, 100, 200), (300, 0, 400, 200)
+    assert t.update([a, b]) == [1, 2]
+    assert t.update([a]) == [1]          # b hidden for 1 frame
+    assert t.update([a]) == [1]          # ... 2 frames
+    assert t.update([a, b]) == [1, 2]    # back within max_age: same ID
+    for _ in range(3):
+        t.update([a])                    # hidden 3 frames > max_age
+    assert t.update([a, b]) == [1, 3]
+    print("Test 10 PASSED")
+    return True
+
+
+def test_fill_timeline():
+    """
+    Test 11: fill only rises; a short dip is ignored; a lasting drop is a collection.
+    """
+    print("\n--- Running Test 11: Fill Timeline ---")
+    from services.temporal import FillTimeline
+    s = Settings()
+    s.smoothing_window, s.collection_frames, s.collection_drop_pct = 3, 3, 30.0
+    tl = FillTimeline(s)
+    levels = [tl.update(1, v)[0] for v in [20, 40, 35, 60, 5, 62, 60]]
+    print(f"  Levels: {levels}")
+    assert levels == sorted(levels), levels          # the 35 and the lone 5 never lower it
+    collected = [tl.update(1, v)[1] for v in [5, 5, 5, 5, 5]]
+    assert collected.count(True) == 1 and tl.level(1) < 10, (collected, tl.level(1))
+    print("Test 11 PASSED")
+    return True
+
+
+def test_change_mask():
+    """
+    Test 12: empty-reference differencing finds a new object despite camera
+    shake and a 25% drop in light, and ignores everything else.
+    """
+    print("\n--- Running Test 12: Empty-Reference Differencing ---")
+    from detectors.baseline import change_mask
+    if not test_image_path().exists():
+        print(f"Skipping Test 12: Image not found at {test_image_path()}")
+        return SKIPPED
+    ref = cv2.imread(str(test_image_path()))[100:340, 180:380].copy()  # real bin + mud texture
+    cur = (ref.astype(np.float32) * 0.75).astype(np.uint8)   # dusk
+    cur = np.roll(cur, (2, 3), axis=(0, 1))                  # camera shake
+    cur[140:220, 40:150] = (40, 160, 230)                    # a new bag
+    m = change_mask(ref, cur, Settings()).astype(bool)
+    truth = np.zeros_like(m)
+    truth[140:220, 40:150] = True
+    iou = (m & truth).sum() / (m | truth).sum()
+    print(f"  IoU of change mask with the inserted object: {iou:.2f}")
+    assert iou > 0.85, iou
+    print("Test 12 PASSED")
+    return True
+
+
+def test_camera_config():
+    """
+    Test 13: per-camera ROIs and references round-trip, ROIs rescale with the
+    stream resolution, and unsafe camera ids are refused.
+    """
+    print("\n--- Running Test 13: Camera Config ---")
+    import tempfile
+    import config.cameras as cams
+    cams.CAMERAS_DIR = Path(tempfile.mkdtemp())
+    cams.save_rois("gate_north", [(10, 20, 110, 220)], (640, 480))
+    assert cams.load_rois("gate_north", (1280, 960)) == [(20, 40, 220, 440)]
+    crop = np.full((50, 40, 3), 128, np.uint8)
+    cams.save_reference("gate_north", 0, crop, "day")
+    refs = cams.load_references("gate_north")
+    assert list(refs) == [0] and refs[0][0].shape == crop.shape
+    for bad in ("../etc", "a/b", ""):
+        try:
+            cams.camera_dir(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted unsafe camera id {bad!r}")
+    print("Test 13 PASSED")
+    return True
+
+
 def test_additional_fixtures():
     """
     Test 6: Additional Fixture Images (Structural Sanity)
@@ -430,6 +538,11 @@ TESTS = [
     ("Additional Fixture Images", test_additional_fixtures),
     ("Occupancy Invariants", test_occupancy_invariants),
     ("Open-Vocab Scale Caching", test_scale_caching),
+    ("Evaluation Metrics", test_eval_metrics),
+    ("Tracker Grace Period", test_tracker_grace),
+    ("Fill Timeline", test_fill_timeline),
+    ("Empty-Reference Differencing", test_change_mask),
+    ("Camera Config", test_camera_config),
 ]
 
 

@@ -59,6 +59,7 @@ class BinDetection:
                                                # surface (walls/shell), when the
                                                # detector produces one. Occupancy
                                                # uses it as the wall mask.
+    roi_index: Optional[int] = None        # Position in the manual ROI list (fixed cameras)
 
 
 # ---------------------------------------------------------------------------
@@ -68,10 +69,12 @@ class BinDetection:
 class _SimpleTracker:
     """Greedy IoU-based tracker for maintaining bin IDs across frames."""
 
-    def __init__(self, iou_threshold: float = 0.3) -> None:
+    def __init__(self, iou_threshold: float = 0.3, max_age: int = 0) -> None:
         self._next_id: int = 1
         self._tracks: Dict[int, Tuple[int, int, int, int]] = {}
+        self._misses: Dict[int, int] = {}  # Consecutive frames each track went unmatched
         self._iou_thresh = iou_threshold
+        self._max_age = max_age
 
     @staticmethod
     def _iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
@@ -110,12 +113,17 @@ class _SimpleTracker:
                 self._tracks[self._next_id] = bbox
                 self._next_id += 1
 
-        active_ids = set(ids)
-        self._tracks = {k: v for k, v in self._tracks.items() if k in active_ids}
+        # Keep an unmatched track for max_age frames, so a bin hidden by a
+        # passer-by gets its old ID (and smoothing history) back.
+        for tid in list(self._tracks):
+            self._misses[tid] = 0 if tid in ids else self._misses.get(tid, 0) + 1
+            if self._misses[tid] > self._max_age:
+                del self._tracks[tid], self._misses[tid]
         return ids
 
     def reset(self) -> None:
         self._tracks.clear()
+        self._misses.clear()
         self._next_id = 1
 
 
@@ -131,7 +139,7 @@ class BinDetector:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._model = None
-        self._tracker = _SimpleTracker()
+        self._tracker = _SimpleTracker(max_age=settings.track_max_age)
         self._model_loaded = False
         self._ov_model = None
         self._ov_loaded = False
@@ -494,6 +502,7 @@ class BinDetector:
                 bbox=(bx1, by1, bx2, by2),
                 interior_mask=interior,
                 confidence=1.0,
+                roi_index=idx,
                 rim_top_y=by1,
                 rim_bottom_y=by2,
                 bin_color_name=color_name,

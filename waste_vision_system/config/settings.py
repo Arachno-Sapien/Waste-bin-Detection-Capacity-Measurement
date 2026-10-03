@@ -228,6 +228,17 @@ class Settings:
     rtsp_reconnect_max: float = 30.0
     rtsp_buffer_size: int = 1
 
+    # ---- Fixed-camera temporal model ----
+    track_max_age: int = 15             # Processed frames a lost bin keeps its ID
+    temporal_mode: str = "median"       # "median" | "monotonic" (fixed cameras)
+    collection_drop_pct: float = 30.0   # A drop this far below the level may be a collection...
+    collection_frames: int = 5          # ...and is accepted after this many readings in a row
+    occlusion_person_frac: float = 0.15 # Skip a reading when people cover this much of the bin
+
+    # ---- Empty-bin reference differencing ----
+    baseline_diff_thresh: float = 18.0  # LAB distance that counts as "changed"
+    baseline_min_blob_frac: float = 0.002  # Drop change blobs smaller than this share of the crop
+
     # ---- Export ----
     csv_flush_interval: int = 100
 

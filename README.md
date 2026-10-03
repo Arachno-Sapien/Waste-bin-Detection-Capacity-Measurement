@@ -69,21 +69,28 @@ waste_vision_system/
 ├── check_requirements.bat   # Checks Python/pip, installs requirements.txt
 ├── requirements.txt
 ├── verify_system.py         # Test suite — see §6
+├── evaluate.py              # Accuracy scorecard on a labelled dataset (see enhancements.md)
+├── tools/                   # make_splits.py (dataset splits), setup_camera.py (fixed cameras)
 ├── yolo11n-seg.pt            # Waste detection model (COCO-pretrained)
 ├── yoloe-11l-seg.pt          # Bin detection model (open-vocabulary) — auto-downloaded
 ├── yoloe-11l-seg-bins.pt     # Same, prompts baked in — generated on first run
 ├── mobileclip_blt.ts         # Text encoder — auto-downloaded; only used to (re-)bake the prompts
 │
-├── config/settings.py        # All tunables — one dataclass, see §5
+├── config/
+│   ├── settings.py           # All tunables — one dataclass, see §5
+│   └── cameras.py            # Per-camera ROIs and empty-bin references (fixed cameras)
 ├── detectors/
 │   ├── bin_detector.py       # BinDetector — 4 strategies, see §3
-│   └── waste_detector.py     # WasteDetector — YOLO + colour-inversion + overflow band
+│   ├── waste_detector.py     # WasteDetector — YOLO + colour-inversion + overflow band
+│   └── baseline.py           # Waste as "changed since the bin was empty" (fixed cameras)
 ├── services/
+│   ├── pipeline.py           # analyse_frame(): the per-frame pipeline app, CLI and evaluate.py share
 │   ├── occupancy.py          # OccupancyEstimator — 3-factor fill calculation
+│   ├── temporal.py           # Fill that only rises between collections (fixed cameras)
 │   ├── stream_handler.py     # Webcam/RTSP lifecycle
 │   └── logger.py             # CSV logging (appends to a per-session file)
 ├── ui/
-│   ├── app.py                 # Streamlit dashboard + process_frame() pipeline
+│   ├── app.py                 # Streamlit dashboard (process_frame() calls services/pipeline.py)
 │   └── components.py          # Sidebar widgets, cards, buttons
 ├── utils/
 │   ├── drawing.py             # HUD overlay rendering
@@ -235,13 +242,42 @@ end of a headless run); that file holds the full session, while memory keeps
 only the last 200 rows after each flush (the dashboard's Audit Log shows the
 latest 50).
 
+### Fixed cameras
+
+For a CCTV camera that never moves, save its bin boxes once and give each bin
+a photo of itself empty. The system then skips per-frame bin detection,
+measures waste as "what changed since the bin was empty" (so mud, stickers and
+the background stop counting as waste), and treats fill as only rising until
+a collection. Camera ids use letters, digits, `_` and `-`.
+
+```bash
+python tools/setup_camera.py --camera gate_north --source rtsp://... --roi 100 220 380 900 --roi 420 230 700 905
+python tools/setup_camera.py --camera gate_north --source rtsp://... --tag day
+python main.py --headless --camera gate_north --source rtsp://...
+```
+
+Run the `--tag` command only while every bin is empty, and repeat it with
+`--tag night` / `--tag ir` under those conditions. The dashboard has the same
+controls under Webcam / RTSP Camera → Manual Bin Regions: enter a Camera ID,
+then Load ROIs, Save ROIs and Capture empty reference (they appear once the
+stream shows a frame). Everything is stored in `config/cameras/<id>/`
+(`rois.json` and `empty_<bin>_<tag>.png`, the images git-ignored); the RTSP
+address is never written there.
+
+**Check after every capture:** every bin should now read EMPTY; drop one bag
+into a bin and confirm that bin rises. A reference taken while a bin isn't
+empty makes that bin read empty from then on. Recapture after a bin is
+replaced, moved or repainted, and once per season.
+`python evaluate.py --split val --cameras` scores a labelled set in this mode.
+
 ### Test
 
 ```bash
 python verify_system.py
 ```
 
-Eight tests, run independently (one failure doesn't block the rest):
+Thirteen tests, run independently (one failure doesn't block the rest). Tests
+9 to 13 need no model and run in under a second each.
 
 | # | Test | Validates |
 |---|---|---|
@@ -253,6 +289,11 @@ Eight tests, run independently (one failure doesn't block the rest):
 | 6 | Additional fixtures | Every other image in `tests/fixtures/` processes without error |
 | 7 | Occupancy invariants | Fill tiers have no gaps; overflow score is independent of frame size and bin position |
 | 8 | Scale caching | Frame 2 of a scene runs only the cached YOLOE scale, with identical boxes; reset clears it |
+| 9 | Evaluation metrics | `evaluate.py` box matching, precision/recall, tier accuracy, abstain rate |
+| 10 | Tracker grace period | A bin hidden for a few frames keeps its ID; one gone too long gets a new one |
+| 11 | Fill timeline | Fill only rises; a short dip is ignored; a lasting drop counts as a collection |
+| 12 | Empty-reference differencing | A new object is found despite camera shake and dimmer light (needs `001.jpg`) |
+| 13 | Camera config | ROIs and references round-trip, rescale with resolution; unsafe camera ids refused |
 
 A test that needs a fixture image reports **SKIP**, not a silent pass, if
 that image is missing — exit code 2 means "incomplete", not "passed", so a

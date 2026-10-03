@@ -32,6 +32,7 @@ import cv2
 import numpy as np
 
 from config.settings import Settings, WASTE_COCO_MAPPING
+from detectors.baseline import change_mask
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,7 @@ class WasteDetector:
         self._is_custom_model = False
         self._class_names: Dict[int, str] = {}
         self._has_seg_masks = False
+        self.last_person_frac = 0.0  # Share of the last search region covered by people
 
     # ---- Lazy model loading ------------------------------------------------
 
@@ -252,6 +254,20 @@ class WasteDetector:
         out[band_y1:y2, x1:x2] = np.isin(labels, keep).astype(np.uint8) * sub
         return out
 
+    @staticmethod
+    def search_region(
+        bbox: Tuple[int, int, int, int],
+        frame_shape: Tuple[int, ...],
+        band_ratio: float,
+    ) -> Tuple[int, int, int, int]:
+        """The bin box clipped to the frame and extended upward by the overflow
+        band: the region waste is searched in. Reference capture and crop
+        export use it too, so all three cover exactly the same pixels."""
+        h, w = frame_shape[:2]
+        x1, y1 = max(0, bbox[0]), max(0, bbox[1])
+        x2, y2 = min(w, bbox[2]), min(h, bbox[3])
+        return x1, max(0, y1 - int((y2 - y1) * band_ratio)), x2, y2
+
     def detect(
         self,
         frame: np.ndarray,
@@ -259,6 +275,7 @@ class WasteDetector:
         interior_mask: Optional[np.ndarray] = None,
         bin_color_name: str = "unknown",
         bin_hsv_range: Optional[Tuple[Tuple[int, int, int], Tuple[int, int, int]]] = None,
+        reference: Optional[np.ndarray] = None,
     ) -> List[WasteDetection]:
         """
         Detect waste items within a bin region.
@@ -272,6 +289,7 @@ class WasteDetector:
         x1, y1, x2, y2 = bin_bbox
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(w, x2), min(h, y2)
+        self.last_person_frac = 0.0
 
         # ---- Overflow band ----
         # Waste heaped above the rim lies outside the bin box entirely, so a
@@ -281,8 +299,8 @@ class WasteDetector:
         # texture-gated below so flat background (wall, sky, pavement) above a
         # bin is not mistaken for waste.
         bin_top = y1
-        band_h = int((y2 - y1) * self._settings.waste_overflow_band_ratio)
-        band_y1 = max(0, y1 - band_h)
+        _, band_y1, _, _ = self.search_region(
+            bin_bbox, frame.shape, self._settings.waste_overflow_band_ratio)
         if band_y1 < bin_top:
             if interior_mask is not None:
                 interior_mask = interior_mask.copy().astype(np.uint8)
@@ -323,6 +341,10 @@ class WasteDetector:
                             else:
                                 class_name = WASTE_COCO_MAPPING.get(raw_name, None)
                                 if class_name is None:
+                                    if raw_name == "person":  # someone in front of the bin
+                                        pw, ph = boxes.xywh[i, 2:].cpu().numpy()
+                                        self.last_person_frac = min(1.0, self.last_person_frac
+                                            + float(pw * ph) / (crop.shape[0] * crop.shape[1]))
                                     continue  # Skip non-waste COCO classes
 
                             # Map crop coords to full-frame
@@ -367,16 +389,22 @@ class WasteDetector:
 
         # ---- Part 2: Non-bin-colour pixel analysis ----
         if self._settings.non_bin_color_enabled:
-            color_mask = self._non_bin_color_mask(
-                frame, x1, y1, x2, y2,
-                bin_color_name, bin_hsv_range, interior_mask,
-            )
+            if reference is not None:
+                # Empty-bin reference: waste = what changed since the bin was
+                # empty. Background cancels out, so the band gates are not needed.
+                color_mask = np.zeros((h, w), dtype=np.uint8)
+                color_mask[y1:y2, x1:x2] = change_mask(reference, frame[y1:y2, x1:x2], self._settings)
+            else:
+                color_mask = self._non_bin_color_mask(
+                    frame, x1, y1, x2, y2,
+                    bin_color_name, bin_hsv_range, interior_mask,
+                )
 
-            if band_y1 < bin_top and self._settings.waste_overflow_edge_gate:
+            if reference is None and band_y1 < bin_top and self._settings.waste_overflow_edge_gate:
                 color_mask = self._gate_band_by_texture(
                     frame, color_mask, x1, band_y1, x2, bin_top
                 )
-            if band_y1 < bin_top and self._settings.waste_overflow_require_contact:
+            if reference is None and band_y1 < bin_top and self._settings.waste_overflow_require_contact:
                 color_mask = self._keep_band_joined_to_bin(
                     color_mask, x1, band_y1, x2, bin_top, y2
                 )

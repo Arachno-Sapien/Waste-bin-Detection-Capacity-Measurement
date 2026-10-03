@@ -3,6 +3,13 @@ waste_vision_system/mobileclip_blt.ts
 waste_vision_system/yoloe-11l-seg.pt
 waste_vision_system/yoloe-11l-seg-bins.pt
 
+# datasets: labels and meta are tracked, images are not (size, privacy)
+waste_vision_system/datasets/**/images/
+waste_vision_system/datasets/bins_det/
+waste_vision_system/datasets/fill/
+waste_vision_system/runs/
+waste_vision_system/config/cameras/*/empty_*.png
+
 # runtime output and caches
 waste_vision_system/exports/
 __pycache__/

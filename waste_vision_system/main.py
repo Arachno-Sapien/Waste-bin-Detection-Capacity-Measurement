@@ -31,7 +31,9 @@ def _run_headless(args: argparse.Namespace) -> None:
     from config.settings import Settings
     from detectors.bin_detector import BinDetector
     from detectors.waste_detector import WasteDetector
-    from services.occupancy import OccupancyEstimator, wall_mask_for
+    from config.cameras import load_references, load_rois
+    from services.occupancy import OccupancyEstimator
+    from services.pipeline import analyse_frame
     from services.stream_handler import StreamHandler
     from services.logger import DataLogger
     from utils.drawing import draw_bin_overlay, draw_hud_header, draw_no_detection
@@ -64,6 +66,18 @@ def _run_headless(args: argparse.Namespace) -> None:
         print("[Waste Vision] ERROR: Failed to open source.")
         sys.exit(1)
 
+    references = None
+    if args.camera:
+        # Fixed camera: its saved bin ROIs, its empty-bin references, and
+        # fill that only rises between collections.
+        rois = load_rois(args.camera, stream.frame_size)
+        if rois:
+            bin_detector.set_manual_rois(rois)
+        references = load_references(args.camera)
+        settings.temporal_mode = "monotonic"
+        print(f"[Waste Vision] Camera {args.camera}: {len(rois)} ROIs, "
+              f"empty references for {len(references)} of them")
+
     # Video writer setup
     writer = None
     if args.output:
@@ -93,38 +107,18 @@ def _run_headless(args: argparse.Namespace) -> None:
             annotated = frame.copy()
 
             # Pipeline
-            bin_dets = bin_detector.detect(frame)
-
-            if not bin_dets:
+            results = analyse_frame(frame, settings, bin_detector, waste_detector,
+                                    occ_estimator, references)
+            if not results:
                 draw_no_detection(annotated)
-            else:
-                hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-                for bd in bin_dets:
-                    waste_dets = waste_detector.detect(
-                        frame, bd.bbox, bd.interior_mask,
-                        bin_color_name=getattr(bd, 'bin_color_name', 'unknown'),
-                        bin_hsv_range=getattr(bd, 'bin_hsv_range', None),
-                    )
+            for bd, occ, waste_dets in results:
+                draw_bin_overlay(annotated, bd, occ, waste_dets)
+                logger.log_entry(occ.bin_id, occ.fill_pct, occ.status, bd.confidence)
+                print(f"  Frame {frame_count}: Bin #{occ.bin_id} → "
+                      f"{occ.fill_pct:.0f}% ({occ.status.value})  "
+                      f"[{fps_cnt.fps:.1f} FPS]", end="\r")
 
-                    # Build bin wall mask for aperture-focused occupancy: the
-                    # detector's own surface mask if it made one, else an
-                    # expanded HSV colour-range match.
-                    bin_color_mask = wall_mask_for(bd, hsv_frame)
-
-                    waste_masks = [wd.mask for wd in waste_dets]
-                    occ = occ_estimator.estimate(
-                        bd.bin_id, bd.interior_mask, waste_masks,
-                        bd.rim_top_y, bd.rim_bottom_y,
-                        bin_color_mask=bin_color_mask,
-                    )
-                    draw_bin_overlay(annotated, bd, occ, waste_dets)
-                    logger.log_entry(occ.bin_id, occ.fill_pct, occ.status, bd.confidence)
-
-                    print(f"  Frame {frame_count}: Bin #{occ.bin_id} → "
-                          f"{occ.fill_pct:.0f}% ({occ.status.value})  "
-                          f"[{fps_cnt.fps:.1f} FPS]", end="\r")
-
-            draw_hud_header(annotated, fps_cnt.fps, len(bin_dets), fps_cnt.latency_ms)
+            draw_hud_header(annotated, fps_cnt.fps, len(results), fps_cnt.latency_ms)
 
             if writer:
                 writer.write(annotated)
@@ -187,6 +181,11 @@ def main() -> None:
     parser.add_argument(
         "--no-display", action="store_true",
         help="Disable cv2.imshow window in headless mode.",
+    )
+    parser.add_argument(
+        "--camera", type=str, default=None,
+        help="Fixed-camera id: use its saved bin ROIs and empty references "
+             "(config/cameras/<id>/, see tools/setup_camera.py).",
     )
 
     args = parser.parse_args()
